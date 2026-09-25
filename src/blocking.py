@@ -32,6 +32,7 @@ import os
 import sys
 import time
 from collections import defaultdict
+from multiprocessing import Pool
 from typing import Dict, List, Optional, Set, Tuple
 
 import numpy as np
@@ -91,6 +92,59 @@ def soundex(word: str) -> str:
             encoded.append(c)
         prev = c
     return (first + "".join(encoded) + "0000")[:4]
+
+
+def _extract_keys_worker(batch: List[Dict[str, str]]) -> List[Tuple[str, List[str]]]:
+    """Worker function for parallel extraction of blocking keys."""
+    results = []
+    for raw_rec in batch:
+        eid = raw_rec["entity_id"]
+        cntry = raw_rec.get("country", "")
+        nm = raw_rec.get("business_name", raw_rec.get("name", ""))
+        addr = raw_rec.get("business_address", raw_rec.get("address", ""))
+
+        nm_clean = normalize_name(nm)
+        nm_words = nm_clean.split()
+        addr_clean = normalize_address(addr, cntry)
+        addr_words = addr_clean.split()
+        nums = extract_numbers(addr)
+
+        state = ""
+        for tok in addr_words:
+            if len(tok) == 2 and tok.isalpha():
+                state = tok
+                break
+        postal = ""
+        for n in nums:
+            if len(n) == 5 or len(n) == 6:
+                postal = n
+                break
+
+        keys = []
+        if state and len(nm_clean) >= 3:
+            keys.append(f"st_nm3:{cntry}:{state}:{nm_clean[:3]}")
+            keys.append(f"st_nm4:{cntry}:{state}:{nm_clean[:4]}")
+        if postal and len(nm_clean) >= 3:
+            keys.append(f"zip_nm:{cntry}:{postal}:{nm_clean[:3]}")
+        if nums and len(addr_words) >= 2:
+            house_num = nums[0]
+            for w in addr_words:
+                if len(w) >= 4 and not w.isdigit() and w not in (
+                    "street", "road", "avenue", "drive", "lane", "boulevard", "unit"
+                ):
+                    keys.append(f"num_street:{cntry}:{house_num}:{w[:4]}")
+                    break
+        nm_sorted = normalize_name_tokens(nm)
+        if len(nm_sorted) >= 4:
+            keys.append(f"nm_sort4:{cntry}:{nm_sorted[:4]}")
+        if nm_words:
+            sx = soundex(nm_words[0])
+            if sx:
+                keys.append(f"soundex:{cntry}:{sx}")
+                if state:
+                    keys.append(f"st_soundex:{cntry}:{state}:{sx}")
+        results.append((eid, keys))
+    return results
 
 
 # =============================================================================
@@ -230,101 +284,127 @@ class CandidateBlocker:
     ) -> Dict[str, Set[str]]:
         """
         Generates candidate matches from S2 and S3 for every Source 1 entity.
-        Returns mapping: {s1_entity_id: set(candidate_s2_s3_ids)}
+        High-performance parallel indexing with multi-core auto-scaling.
         """
         t0 = time.time()
+        n_targets = len(s2_records) + len(s3_records)
+        n_s1 = len(s1_records)
         if verbose:
-            print("[Blocking] 1/3 Preprocessing records across sources...")
+            print(f"[Blocking] 1/2 Parallel indexing {n_targets:,} target records (S2+S3)...")
 
-        # Preprocess records
-        s1_prep = {eid: self.preprocess_record(r) for eid, r in s1_records.items()}
-        s2_prep = {eid: self.preprocess_record(r) for eid, r in s2_records.items()}
-        s3_prep = {eid: self.preprocess_record(r) for eid, r in s3_records.items()}
+        inverted_index: Dict[str, Set[str]] = defaultdict(set)
+        candidates: Dict[str, Set[str]] = {s1_id: set() for s1_id in s1_records}
 
-        candidates: Dict[str, Set[str]] = defaultdict(set)
+        n_workers = min(12, os.cpu_count() or 4)
+        batch_size = 10000
 
-        # ---------------------------------------------------------
-        # Strategy A: Inverted Index Multi-Key Blocking
-        # ---------------------------------------------------------
-        if self.use_rule_keys:
+        def _index_records_stream(records_dict, name):
+            rec_list = list(records_dict.values())
+            total = len(rec_list)
+            if total == 0:
+                return
+            chunks = [rec_list[i:i + batch_size] for i in range(0, total, batch_size)]
+            indexed = 0
+            t_start = time.time()
+
+            if total > 5000 and n_workers > 1:
+                with Pool(processes=n_workers) as pool:
+                    for batch_res in pool.imap_unordered(_extract_keys_worker, chunks, chunksize=1):
+                        for eid, keys in batch_res:
+                            for k in keys:
+                                inverted_index[k].add(eid)
+                        indexed += len(batch_res)
+                        if verbose and (indexed % 500000 < batch_size or indexed == total):
+                            rate = indexed / max(0.01, time.time() - t_start)
+                            pct = (indexed / total) * 100
+                            print(f"  * [{name}] Indexed {indexed:,} / {total:,} records ({pct:.1f}%) at {rate:,.0f} rec/s")
+            else:
+                for chunk in chunks:
+                    batch_res = _extract_keys_worker(chunk)
+                    for eid, keys in batch_res:
+                        for k in keys:
+                            inverted_index[k].add(eid)
+                    indexed += len(batch_res)
+
+        # 1. Index S2 and S3
+        _index_records_stream(s2_records, "Source 2")
+        _index_records_stream(s3_records, "Source 3")
+
+        if verbose:
+            print(f"[Blocking] Inverted index ready with {len(inverted_index):,} unique keys ({time.time() - t0:.2f}s).")
+            print(f"[Blocking] 2/2 Querying candidates for {n_s1:,} Source 1 entities...")
+
+        # 2. Query S1 entities against inverted index
+        t1 = time.time()
+        s1_list = list(s1_records.values())
+        s1_chunks = [s1_list[i:i + batch_size] for i in range(0, n_s1, batch_size)]
+        queried = 0
+
+        if n_s1 > 5000 and n_workers > 1:
+            with Pool(processes=n_workers) as pool:
+                for batch_res in pool.imap_unordered(_extract_keys_worker, s1_chunks, chunksize=1):
+                    for eid, keys in batch_res:
+                        s1_cands = candidates[eid]
+                        for k in keys:
+                            if k in inverted_index:
+                                s1_cands.update(inverted_index[k])
+                    queried += len(batch_res)
+                    if verbose and (queried % 250000 < batch_size or queried == n_s1):
+                        rate = queried / max(0.01, time.time() - t1)
+                        pct = (queried / n_s1) * 100
+                        print(f"  * [Source 1] Matched {queried:,} / {n_s1:,} entities ({pct:.1f}%) at {rate:,.0f} rec/s")
+        else:
+            for chunk in s1_chunks:
+                batch_res = _extract_keys_worker(chunk)
+                for eid, keys in batch_res:
+                    s1_cands = candidates[eid]
+                    for k in keys:
+                        if k in inverted_index:
+                            s1_cands.update(inverted_index[k])
+                queried += len(batch_res)
+
+        # TF-IDF fallback only for small sets (e.g. smoke tests) where cartesian space is negligible
+        if self.use_tfidf and (n_s1 + n_targets) <= 5000:
             if verbose:
-                print("[Blocking] 2/3 Building multi-key inverted index...")
-            inverted_index = defaultdict(set)
-
-            # Index S2 and S3
-            for eid, rec in s2_prep.items():
-                for k in self.generate_blocking_keys(rec):
-                    inverted_index[k].add(eid)
-
-            for eid, rec in s3_prep.items():
-                for k in self.generate_blocking_keys(rec):
-                    inverted_index[k].add(eid)
-
-            # Query inverted index for each S1 entity
-            for s1_id, rec in s1_prep.items():
-                for k in self.generate_blocking_keys(rec):
-                    if k in inverted_index:
-                        candidates[s1_id].update(inverted_index[k])
-
-        # ---------------------------------------------------------
-        # Strategy B: TF-IDF + Cosine kNN Search
-        # ---------------------------------------------------------
-        if self.use_tfidf:
-            if verbose:
-                print("[Blocking] 3/3 Running TF-IDF character n-gram cosine kNN...")
-
+                print("  * Running TF-IDF fallback on small evaluation subset...")
+            s1_prep = {eid: self.preprocess_record(r) for eid, r in s1_records.items()}
+            s2_prep = {eid: self.preprocess_record(r) for eid, r in s2_records.items()}
+            s3_prep = {eid: self.preprocess_record(r) for eid, r in s3_records.items()}
             countries = set(r["country"] for r in s1_prep.values())
             for cntry in sorted(countries):
                 s1_sub = [eid for eid, r in s1_prep.items() if r["country"] == cntry]
                 s2_sub = [eid for eid, r in s2_prep.items() if r["country"] == cntry]
                 s3_sub = [eid for eid, r in s3_prep.items() if r["country"] == cntry]
                 target_sub = s2_sub + s3_sub
-
-                if not s1_sub or not target_sub:
+                if not s1_sub or not target_sub or len(s1_sub) * len(target_sub) > 1000000:
                     continue
-
-                # Safety check: avoid OOM on massive cartesian spaces where inverted index already covers candidates
-                if len(s1_sub) * len(target_sub) > 2_000_000:
-                    if verbose:
-                        print(f"  [Blocking Guard] Country '{cntry}' space ({len(s1_sub)} x {len(target_sub)}) too large for dense TF-IDF matrix. Relying on multi-key inverted index.")
-                    continue
-
                 corpus = [s1_prep[eid]["full_text"] for eid in s1_sub] + [
                     (s2_prep[eid]["full_text"] if eid in s2_prep else s3_prep[eid]["full_text"])
                     for eid in target_sub
                 ]
-
                 vectorizer = TfidfVectorizer(
-                    analyzer="char_wb",
-                    ngram_range=self.ngram_range,
-                    min_df=1,
-                    sublinear_tf=True,
+                    analyzer="char_wb", ngram_range=self.ngram_range, min_df=1, sublinear_tf=True
                 )
                 X = vectorizer.fit_transform(corpus)
-
-                n_s1 = len(s1_sub)
-                X_s1 = X[:n_s1]
-                X_targets = X[n_s1:]
-
-                # Cosine similarity matrix via sparse dot product
-                sim_matrix = X_s1.dot(X_targets.T).toarray()
-
+                n_s = len(s1_sub)
+                sim_matrix = X[:n_s].dot(X[n_s:].T).toarray()
                 for i, s1_id in enumerate(s1_sub):
                     row_sims = sim_matrix[i]
-                    # Select top k
                     top_k_indices = np.argsort(row_sims)[::-1][:self.k_neighbors]
                     for idx in top_k_indices:
                         if row_sims[idx] >= self.min_similarity:
                             candidates[s1_id].add(target_sub[idx])
 
-        # Ensure all S1 entities exist in the candidates dictionary
+        # Ensure all S1 entities exist in candidates
         for s1_id in s1_records:
             if s1_id not in candidates:
                 candidates[s1_id] = set()
 
         if verbose:
             dur = time.time() - t0
-            print(f"[Blocking] Candidate generation finished in {dur:.2f}s.")
+            tot_c = sum(len(c) for c in candidates.values())
+            avg_c = tot_c / max(1, len(candidates))
+            print(f"[Blocking] Candidate generation finished in {dur:.2f}s (Total: {tot_c:,} pairs, Avg: {avg_c:.1f} per entity).")
 
         return candidates
 
