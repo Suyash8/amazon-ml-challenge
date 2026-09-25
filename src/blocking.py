@@ -94,6 +94,13 @@ def soundex(word: str) -> str:
     return (first + "".join(encoded) + "0000")[:4]
 
 
+BLOCKING_STOPWORDS = {
+    "and", "the", "of", "for", "in", "at", "to", "a", "an", "co", "company",
+    "corp", "corporation", "inc", "incorporated", "ltd", "limited", "pvt", "llc",
+    "gmbh", "sarl", "sa", "bv", "center", "services", "group", "holdings", "enterprise"
+}
+
+
 def _extract_keys_worker(batch: List[Dict[str, str]]) -> List[Tuple[str, List[str]]]:
     """Worker function for parallel extraction of blocking keys."""
     results = []
@@ -134,15 +141,19 @@ def _extract_keys_worker(batch: List[Dict[str, str]]) -> List[Tuple[str, List[st
                 ):
                     keys.append(f"num_street:{cntry}:{house_num}:{w[:4]}")
                     break
-        nm_sorted = normalize_name_tokens(nm)
-        if len(nm_sorted) >= 4:
-            keys.append(f"nm_sort4:{cntry}:{nm_sorted[:4]}")
-        if nm_words:
+
+        # Stopword-free sorted name tokens
+        clean_tokens = [w for w in nm_words if w not in BLOCKING_STOPWORDS and len(w) >= 2]
+        if clean_tokens:
+            nm_sorted = " ".join(sorted(clean_tokens))
+            if len(nm_sorted) >= 4:
+                keys.append(f"nm_sort4:{cntry}:{nm_sorted[:4]}")
+
+        # Phonetic Keys (Soundex) - bound to state to prevent nationwide Cartesian explosion
+        if nm_words and state:
             sx = soundex(nm_words[0])
             if sx:
-                keys.append(f"soundex:{cntry}:{sx}")
-                if state:
-                    keys.append(f"st_soundex:{cntry}:{state}:{sx}")
+                keys.append(f"st_soundex:{cntry}:{state}:{sx}")
         results.append((eid, keys))
     return results
 
@@ -330,15 +341,24 @@ class CandidateBlocker:
         _index_records_stream(s2_records, "Source 2")
         _index_records_stream(s3_records, "Source 3")
 
-        if verbose:
-            print(f"[Blocking] Inverted index ready with {len(inverted_index):,} unique keys ({time.time() - t0:.2f}s).")
-            print(f"[Blocking] 2/2 Querying candidates for {n_s1:,} Source 1 entities...")
+        # 2. Prune oversized inverted index keys (>250 target records) to eliminate noise & RAM explosion
+        max_bucket_size = 250
+        pruned_keys = 0
+        for k in list(inverted_index.keys()):
+            if len(inverted_index[k]) > max_bucket_size:
+                del inverted_index[k]
+                pruned_keys += 1
 
-        # 2. Query S1 entities against inverted index
+        if verbose:
+            print(f"[Blocking] Inverted index optimized: {len(inverted_index):,} active keys ({pruned_keys:,} stop-keys pruned, {time.time() - t0:.2f}s).")
+            print(f"[Blocking] 2/2 Querying candidates for {n_s1:,} Source 1 entities (bounded <= 50 cands/entity)...")
+
+        # 3. Query S1 entities against inverted index with per-entity candidate cap
         t1 = time.time()
         s1_list = list(s1_records.values())
         s1_chunks = [s1_list[i:i + batch_size] for i in range(0, n_s1, batch_size)]
         queried = 0
+        max_cands = 50
 
         if n_s1 > 5000 and n_workers > 1:
             with Pool(processes=n_workers) as pool:
@@ -347,7 +367,12 @@ class CandidateBlocker:
                         s1_cands = candidates[eid]
                         for k in keys:
                             if k in inverted_index:
-                                s1_cands.update(inverted_index[k])
+                                for cid in inverted_index[k]:
+                                    s1_cands.add(cid)
+                                    if len(s1_cands) >= max_cands:
+                                        break
+                            if len(s1_cands) >= max_cands:
+                                break
                     queried += len(batch_res)
                     if verbose and (queried % 250000 < batch_size or queried == n_s1):
                         rate = queried / max(0.01, time.time() - t1)
@@ -360,7 +385,12 @@ class CandidateBlocker:
                     s1_cands = candidates[eid]
                     for k in keys:
                         if k in inverted_index:
-                            s1_cands.update(inverted_index[k])
+                            for cid in inverted_index[k]:
+                                s1_cands.add(cid)
+                                if len(s1_cands) >= max_cands:
+                                    break
+                        if len(s1_cands) >= max_cands:
+                            break
                 queried += len(batch_res)
 
         # TF-IDF fallback only for small sets (e.g. smoke tests) where cartesian space is negligible
