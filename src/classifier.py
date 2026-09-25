@@ -648,8 +648,12 @@ class EntityResolutionClassifier:
         needed_cids = set()
         for cset in candidates.values():
             needed_cids.update(cset)
-        all_targets = {**s2_records, **s3_records}
-        target_recs = {eid: all_targets[eid] for eid in needed_cids if eid in all_targets}
+        target_recs = {}
+        for eid in needed_cids:
+            if eid in s2_records:
+                target_recs[eid] = s2_records[eid]
+            elif eid in s3_records:
+                target_recs[eid] = s3_records[eid]
         target_prep = {eid: self.blocker.preprocess_record(r) for eid, r in target_recs.items()}
 
         all_records = list(s1_prep.values()) + list(target_prep.values())

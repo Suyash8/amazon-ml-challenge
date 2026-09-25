@@ -29,8 +29,12 @@ import os
 import shutil
 import sys
 import time
+import warnings
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
+
+# Filter noisy sklearn / LightGBM feature name warnings during batch inference
+warnings.filterwarnings("ignore", category=UserWarning)
 
 # System path bootstrap
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
