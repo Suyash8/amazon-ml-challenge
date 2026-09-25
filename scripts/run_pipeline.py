@@ -170,17 +170,22 @@ class PipelineOrchestrator:
         drive_sync_dir: Optional[str] = None,
         device: str = "auto",
         batch_size: int = 2000,
+        max_train_records: int = 50000,
         resume: bool = True,
         smoke_test: bool = False,
     ):
         self.train_dir = Path(train_dir).resolve()
         self.test_dir = Path(test_dir).resolve()
         self.output_dir = Path(output_dir).resolve()
-        self.checkpoint_dir = Path(checkpoint_dir).resolve()
+        if smoke_test and Path(checkpoint_dir).name == "checkpoints":
+            self.checkpoint_dir = (Path(checkpoint_dir) / "smoke_test").resolve()
+        else:
+            self.checkpoint_dir = Path(checkpoint_dir).resolve()
         self.drive_sync_dir = Path(drive_sync_dir).resolve() if drive_sync_dir else None
         self.resume = resume
         self.smoke_test = smoke_test
         self.batch_size = max(100, batch_size)
+        self.max_train_records = max_train_records
 
         # Output paths
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -266,7 +271,12 @@ class PipelineOrchestrator:
                 return str(d_alt)
             raise FileNotFoundError(f"Missing source file or shard directory for {filename_base} in {data_dir}")
 
-        max_load = 500 if self.smoke_test else None
+        if self.smoke_test:
+            max_load = 500
+        elif self.max_train_records and self.max_train_records > 0:
+            max_load = self.max_train_records
+        else:
+            max_load = None
         print(f"  * Loading training data from {self.train_dir}...")
         s1_tr = load_source_tsv(_find_source_path(self.train_dir, "train_source1"), max_records=max_load)
         s2_tr = load_source_tsv(_find_source_path(self.train_dir, "train_source2"), max_records=max_load)
@@ -533,6 +543,7 @@ def parse_args():
     parser.add_argument("--drive-sync-dir", type=str, default=None, help="Google Drive path for persistent sync (e.g. /content/drive/MyDrive/amazon-ml-challenge).")
     parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto", help="Execution device (default: auto).")
     parser.add_argument("--batch-size", type=int, default=2000, help="Inference batch chunk size (default: 2000).")
+    parser.add_argument("--max-train-records", type=int, default=50000, help="Max training entities to load into memory (default: 50000; set 0 for all).")
     parser.add_argument("--no-resume", action="store_true", help="Do not resume; restart all stages fresh.")
     parser.add_argument("--smoke-test", action="store_true", help="Quick sanity run on small subset in ~10 seconds.")
     return parser.parse_args()
@@ -548,6 +559,7 @@ def main():
         drive_sync_dir=args.drive_sync_dir,
         device=args.device,
         batch_size=args.batch_size,
+        max_train_records=args.max_train_records,
         resume=not args.no_resume,
         smoke_test=args.smoke_test,
     )

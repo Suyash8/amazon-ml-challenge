@@ -40,6 +40,7 @@ cross-check is the biggest memory user, and the matching file is the only one sc
 """
 
 import argparse
+import gzip
 import os
 import sys
 
@@ -49,14 +50,43 @@ MATCHING_HEADER = ["source1_entity_id", "matched_entity_ids"]
 CANDIDATE_HEADER = ["source1_entity_id", "candidate_entity_ids"]
 
 
+def _find_test_source(test_dir, base_name):
+    """Locate a source file or directory: .tsv, .tsv.gz, or directory of shards."""
+    p_tsv = os.path.join(test_dir, f"{base_name}.tsv")
+    if os.path.isfile(p_tsv):
+        return p_tsv
+    p_gz = os.path.join(test_dir, f"{base_name}.tsv.gz")
+    if os.path.isfile(p_gz):
+        return p_gz
+    p_dir = os.path.join(test_dir, base_name)
+    if os.path.isdir(p_dir):
+        return p_dir
+    return None
+
+
 def read_ids(path):
-    """Return the set of first-column entity IDs from a source TSV.
+    """Return the set of first-column entity IDs from a source TSV, TSV.GZ, or shard directory.
 
     The header row is skipped and blank lines are ignored.
     """
-    with open(path, encoding="utf-8") as f:
+    if os.path.isdir(path):
+        shard_files = sorted(
+            [os.path.join(path, f) for f in os.listdir(path) if f.endswith(".tsv") or f.endswith(".tsv.gz")]
+        )
+        all_ids = set()
+        for sf in shard_files:
+            all_ids |= read_ids(sf)
+        return all_ids
+
+    ids = set()
+    open_fn = gzip.open if path.endswith(".gz") else open
+    with open_fn(path, "rt", encoding="utf-8") as f:
         next(f, None)  # skip header
-        return {line.split(DELIM, 1)[0].strip() for line in f if line.strip()}
+        for line in f:
+            line_str = line.strip()
+            if line_str:
+                ids.add(line_str.split(DELIM, 1)[0].strip())
+    return ids
 
 
 def examples(items):
@@ -71,19 +101,19 @@ def examples(items):
 def load_match_targets(test_dir, warnings):
     """Return the set of valid S2/S3 match IDs, or ``None`` if unavailable.
 
-    Only called when ``--check-ids`` is on. When ``test_source2.tsv`` or
-    ``test_source3.tsv`` is missing we cannot check that matched IDs exist, so we
+    Only called when ``--check-ids`` is on. When ``test_source2`` or
+    ``test_source3`` is missing we cannot check that matched IDs exist, so we
     record a warning and return ``None`` to signal that the existence check should be
     skipped.
     """
     targets = set()
-    for name in ("test_source2.tsv", "test_source3.tsv"):
-        path = os.path.join(test_dir, name)
-        if not os.path.isfile(path):
+    for base in ("test_source2", "test_source3"):
+        path = _find_test_source(test_dir, base)
+        if not path:
             warnings.append(
-                f"{path} not found — skipping the (optional) check that matched "
+                f"{base} (.tsv/.tsv.gz/directory) not found in {test_dir} — skipping the (optional) check that matched "
                 f"IDs exist in the test set. Every other rule is still checked. "
-                f"This is the lighter-memory mode; provide test_source2/3.tsv to "
+                f"This is the lighter-memory mode; provide test_source2/3 to "
                 f"enable the ID-existence check."
             )
             return None
@@ -214,9 +244,9 @@ def validate(matching_path, candidate_path, test_dir, check_ids=False):
     """
     errors, warnings = [], []
 
-    source1 = os.path.join(test_dir, "test_source1.tsv")
-    if not os.path.isfile(source1):
-        errors.append(f"Test source1 file not found: {source1} (check --test-dir).")
+    source1 = _find_test_source(test_dir, "test_source1")
+    if not source1:
+        errors.append(f"Test source1 file not found in: {test_dir} (check --test-dir).")
         return errors, warnings
     required = read_ids(source1)
     print(f"  required S1 entities: {len(required)}")

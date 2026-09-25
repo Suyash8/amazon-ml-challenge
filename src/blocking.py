@@ -283,6 +283,12 @@ class CandidateBlocker:
                 if not s1_sub or not target_sub:
                     continue
 
+                # Safety check: avoid OOM on massive cartesian spaces where inverted index already covers candidates
+                if len(s1_sub) * len(target_sub) > 2_000_000:
+                    if verbose:
+                        print(f"  [Blocking Guard] Country '{cntry}' space ({len(s1_sub)} x {len(target_sub)}) too large for dense TF-IDF matrix. Relying on multi-key inverted index.")
+                    continue
+
                 corpus = [s1_prep[eid]["full_text"] for eid in s1_sub] + [
                     (s2_prep[eid]["full_text"] if eid in s2_prep else s3_prep[eid]["full_text"])
                     for eid in target_sub
