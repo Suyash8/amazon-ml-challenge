@@ -41,11 +41,10 @@ venv.bak/
 __MACOSX/
 *.tar.gz
 *.tsv
-data/
-dataset_split/
-mini_dataset/
 !dataset_split/**/*.tsv
 !mini_dataset/**/*.tsv
+data/
+
 
 # Intermediate outputs and checkpoints (mirrored to Google Drive)
 checkpoints/

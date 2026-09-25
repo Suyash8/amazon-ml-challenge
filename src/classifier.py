@@ -474,7 +474,16 @@ class EntityResolutionClassifier:
         )
 
         s1_prep = {eid: self.blocker.preprocess_record(r) for eid, r in s1_records.items()}
-        target_recs = {**s2_records, **s3_records}
+        
+        # Only preprocess and vectorize target records that appear in candidate pairs or ground truth
+        needed_target_ids = set()
+        for cset in candidates.values():
+            needed_target_ids.update(cset)
+        for s1_id, gt_set in ground_truth.items():
+            needed_target_ids.update(gt_set)
+
+        all_targets = {**s2_records, **s3_records}
+        target_recs = {eid: all_targets[eid] for eid in needed_target_ids if eid in all_targets}
         target_prep = {eid: self.blocker.preprocess_record(r) for eid, r in target_recs.items()}
 
         all_records = list(s1_prep.values()) + list(target_prep.values())
@@ -634,7 +643,13 @@ class EntityResolutionClassifier:
             )
 
         s1_prep = {eid: self.blocker.preprocess_record(r) for eid, r in s1_records.items()}
-        target_recs = {**s2_records, **s3_records}
+        
+        # Only preprocess target records that actually appear in candidates
+        needed_cids = set()
+        for cset in candidates.values():
+            needed_cids.update(cset)
+        all_targets = {**s2_records, **s3_records}
+        target_recs = {eid: all_targets[eid] for eid in needed_cids if eid in all_targets}
         target_prep = {eid: self.blocker.preprocess_record(r) for eid, r in target_recs.items()}
 
         all_records = list(s1_prep.values()) + list(target_prep.values())

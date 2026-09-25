@@ -393,7 +393,7 @@ def _open_text_or_gz(filepath: str):
     return open(filepath, "r", encoding="utf-8")
 
 
-def load_source_tsv(path: str) -> Dict[str, Dict[str, str]]:
+def load_source_tsv(path: str, max_records: Optional[int] = None) -> Dict[str, Dict[str, str]]:
     """
     Loads a source TSV into a dict of records.
     Supports:
@@ -440,10 +440,12 @@ def load_source_tsv(path: str) -> Dict[str, Dict[str, str]]:
                     "business_address": addr,
                     "country": cntry,
                 }
+                if max_records and len(records) >= max_records:
+                    return records
     return records
 
 
-def load_ground_truth_tsv(path: str) -> Dict[str, Set[str]]:
+def load_ground_truth_tsv(path: str, max_records: Optional[int] = None) -> Dict[str, Set[str]]:
     """
     Loads ground truth matching labels.
     Supports direct .tsv, .tsv.gz, or directory of shards.
@@ -485,6 +487,8 @@ def load_ground_truth_tsv(path: str) -> Dict[str, Set[str]]:
                     gt[s1_id].update(matches)
                 else:
                     gt[s1_id] = matches
+                if max_records and len(gt) >= max_records:
+                    return gt
     return gt
 
 

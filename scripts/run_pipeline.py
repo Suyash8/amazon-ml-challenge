@@ -266,17 +266,41 @@ class PipelineOrchestrator:
                 return str(d_alt)
             raise FileNotFoundError(f"Missing source file or shard directory for {filename_base} in {data_dir}")
 
+        max_load = 500 if self.smoke_test else None
         print(f"  * Loading training data from {self.train_dir}...")
-        s1_tr = load_source_tsv(_find_source_path(self.train_dir, "train_source1"))
-        s2_tr = load_source_tsv(_find_source_path(self.train_dir, "train_source2"))
-        s3_tr = load_source_tsv(_find_source_path(self.train_dir, "train_source3"))
-        gt_tr = load_ground_truth_tsv(_find_source_path(self.train_dir, "train_ground_truth"))
+        s1_tr = load_source_tsv(_find_source_path(self.train_dir, "train_source1"), max_records=max_load)
+        s2_tr = load_source_tsv(_find_source_path(self.train_dir, "train_source2"), max_records=max_load)
+        s3_tr = load_source_tsv(_find_source_path(self.train_dir, "train_source3"), max_records=max_load)
+        gt_tr = load_ground_truth_tsv(_find_source_path(self.train_dir, "train_ground_truth"), max_records=max_load)
 
         if self.smoke_test:
             smoke_s1 = list(s1_tr.keys())[:30]
             s1_tr = {k: s1_tr[k] for k in smoke_s1}
             gt_tr = {k: gt_tr.get(k, set()) for k in smoke_s1}
-            print(f"  [Smoke Test] Subsampled to {len(s1_tr)} S1 entities for rapid verification.")
+            
+            # Filter S2 and S3 to only true matches + a small distractor sample (300 records each)
+            smoke_matches = set()
+            for s in smoke_s1:
+                smoke_matches.update(gt_tr.get(s, set()))
+            s2_keep = set(list(smoke_matches) + list(s2_tr.keys())[:300])
+            s3_keep = set(list(smoke_matches) + list(s3_tr.keys())[:300])
+            s2_tr = {k: s2_tr[k] for k in s2_keep if k in s2_tr}
+            s3_tr = {k: s3_tr[k] for k in s3_keep if k in s3_tr}
+            print(f"  [Smoke Test] Filtered to {len(s1_tr)} S1 entities, {len(s2_tr)} S2 records, {len(s3_tr)} S3 records.")
+        elif len(s1_tr) > 5000:
+            import random
+            rng = random.Random(42)
+            train_sample_keys = rng.sample(list(s1_tr.keys()), 5000)
+            s1_tr = {k: s1_tr[k] for k in train_sample_keys}
+            gt_tr = {k: gt_tr.get(k, set()) for k in train_sample_keys}
+            train_matches = set()
+            for s in train_sample_keys:
+                train_matches.update(gt_tr.get(s, set()))
+            s2_keep = set(list(train_matches) + list(s2_tr.keys())[:20000])
+            s3_keep = set(list(train_matches) + list(s3_tr.keys())[:20000])
+            s2_tr = {k: s2_tr[k] for k in s2_keep if k in s2_tr}
+            s3_tr = {k: s3_tr[k] for k in s3_keep if k in s3_tr}
+            print(f"  [Large-Scale Guard] Sampled {len(s1_tr)} S1 entities ({len(s2_tr)} S2, {len(s3_tr)} S3) for GBDT training.")
 
         # Train classifier with auto hardware tuning
         clf = EntityResolutionClassifier(use_decision_layer=True)
@@ -456,20 +480,28 @@ class PipelineOrchestrator:
                     return str(d_alt)
             raise FileNotFoundError(f"Could not locate {source_name} file or shard directory in {data_dir}")
 
-        s1_te = load_source_tsv(_find_test_path(self.test_dir, "source1"))
-        s2_te = load_source_tsv(_find_test_path(self.test_dir, "source2"))
-        s3_te = load_source_tsv(_find_test_path(self.test_dir, "source3"))
+        max_test_load = 500 if self.smoke_test else None
+        s1_te = load_source_tsv(_find_test_path(self.test_dir, "source1"), max_records=max_test_load)
+        s2_te = load_source_tsv(_find_test_path(self.test_dir, "source2"), max_records=max_test_load)
+        s3_te = load_source_tsv(_find_test_path(self.test_dir, "source3"), max_records=max_test_load)
         try:
-            gt_te = load_ground_truth_tsv(_find_test_path(self.test_dir, "ground_truth"))
+            gt_te = load_ground_truth_tsv(_find_test_path(self.test_dir, "ground_truth"), max_records=max_test_load)
         except FileNotFoundError:
             gt_te = None
 
         if self.smoke_test:
             s1_keys = list(s1_te.keys())[:20]
             s1_te = {k: s1_te[k] for k in s1_keys}
+            smoke_test_matches = set()
             if gt_te:
                 gt_te = {k: gt_te.get(k, set()) for k in s1_keys}
-            print(f"  [Smoke Test] Filtered test set to {len(s1_te)} S1 entities.")
+                for s in s1_keys:
+                    smoke_test_matches.update(gt_te.get(s, set()))
+            s2_te_keys = set(list(smoke_test_matches) + list(s2_te.keys())[:200])
+            s3_te_keys = set(list(smoke_test_matches) + list(s3_te.keys())[:200])
+            s2_te = {k: s2_te[k] for k in s2_te_keys if k in s2_te}
+            s3_te = {k: s3_te[k] for k in s3_te_keys if k in s3_te}
+            print(f"  [Smoke Test] Filtered test set to {len(s1_te)} S1 entities, {len(s2_te)} S2 records, {len(s3_te)} S3 records.")
 
         # 3. Blocking
         candidates = self.run_blocking(clf, s1_te, s2_te, s3_te)
