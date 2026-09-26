@@ -24,6 +24,7 @@ from __future__ import annotations
 import argparse
 import datetime
 import gc
+import gzip
 import json
 import os
 import shutil
@@ -325,35 +326,81 @@ class PipelineOrchestrator:
 
         print(f"  * Streaming training sources for {len(selected_s1)} S1 entities ({len(needed_s2)} S2, {len(needed_s3)} S3 true matches)...")
 
+        def _get_source_files(path_or_dir: str) -> List[str]:
+            p = Path(path_or_dir).resolve()
+            if p.is_dir():
+                target_files = sorted([
+                    str(f) for f in p.glob("*")
+                    if f.name.endswith(".tsv") or f.name.endswith(".tsv.gz")
+                ])
+                if not target_files:
+                    raise FileNotFoundError(f"No .tsv or .tsv.gz shards found in directory: {p}")
+                return target_files
+            elif p.is_file():
+                return [str(p)]
+            elif Path(f"{path_or_dir}.gz").is_file():
+                return [f"{path_or_dir}.gz"]
+            elif (p.parent / p.stem).is_dir():
+                d = p.parent / p.stem
+                target_files = sorted([
+                    str(f) for f in d.glob("*")
+                    if f.name.endswith(".tsv") or f.name.endswith(".tsv.gz")
+                ])
+                if target_files:
+                    return target_files
+            raise FileNotFoundError(f"Source file or shard directory not found: {path_or_dir}")
+
         def _stream_source_subset(filepath, needed_ids, max_distractors=10000):
+            target_files = _get_source_files(filepath)
+            needed_set = set(needed_ids)
             recs = {}
             distractors = 0
-            with open(filepath, "r", encoding="utf-8") as f:
-                header = f.readline().strip().split("\t")
-                eid_idx = header.index("entity_id")
-                name_idx = header.index("business_name") if "business_name" in header else header.index("name")
-                addr_idx = header.index("business_address") if "business_address" in header else header.index("address")
-                cntry_idx = header.index("country")
-                for line in f:
-                    parts = line.strip().split("\t")
-                    eid = parts[eid_idx]
-                    if eid in needed_ids:
-                        recs[eid] = {
-                            "entity_id": eid,
-                            "business_name": parts[name_idx] if len(parts) > name_idx else "",
-                            "business_address": parts[addr_idx] if len(parts) > addr_idx else "",
-                            "country": parts[cntry_idx] if len(parts) > cntry_idx else "",
-                        }
-                    elif distractors < max_distractors and rng.random() < 0.05:
-                        recs[eid] = {
-                            "entity_id": eid,
-                            "business_name": parts[name_idx] if len(parts) > name_idx else "",
-                            "business_address": parts[addr_idx] if len(parts) > addr_idx else "",
-                            "country": parts[cntry_idx] if len(parts) > cntry_idx else "",
-                        }
-                        distractors += 1
-                    if len(recs) >= len(needed_ids) + max_distractors:
-                        break
+            found_needed = 0
+
+            for fpath in target_files:
+                open_fn = gzip.open if fpath.endswith(".gz") else open
+                with open_fn(fpath, "rt", encoding="utf-8") as f:
+                    header_line = f.readline()
+                    if not header_line:
+                        continue
+                    header = header_line.strip().split("\t")
+                    try:
+                        eid_idx = header.index("entity_id")
+                    except ValueError:
+                        eid_idx = 0
+                    name_idx = header.index("business_name") if "business_name" in header else (header.index("name") if "name" in header else 1)
+                    addr_idx = header.index("business_address") if "business_address" in header else (header.index("address") if "address" in header else 2)
+                    cntry_idx = header.index("country") if "country" in header else 3
+
+                    for line in f:
+                        line_str = line.strip()
+                        if not line_str:
+                            continue
+                        parts = line_str.split("\t")
+                        if len(parts) <= eid_idx:
+                            continue
+                        eid = parts[eid_idx]
+                        if eid in needed_set:
+                            if eid not in recs:
+                                found_needed += 1
+                            recs[eid] = {
+                                "entity_id": eid,
+                                "business_name": parts[name_idx] if len(parts) > name_idx else "",
+                                "business_address": parts[addr_idx] if len(parts) > addr_idx else "",
+                                "country": parts[cntry_idx] if len(parts) > cntry_idx else "",
+                            }
+                        elif distractors < max_distractors and rng.random() < 0.05:
+                            recs[eid] = {
+                                "entity_id": eid,
+                                "business_name": parts[name_idx] if len(parts) > name_idx else "",
+                                "business_address": parts[addr_idx] if len(parts) > addr_idx else "",
+                                "country": parts[cntry_idx] if len(parts) > cntry_idx else "",
+                            }
+                            distractors += 1
+
+                        if found_needed >= len(needed_set) and distractors >= max_distractors:
+                            return recs
+
             return recs
 
         s1_tr = _stream_source_subset(s1_path, selected_s1, max_distractors=0)
