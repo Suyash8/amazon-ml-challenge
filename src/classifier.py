@@ -50,6 +50,8 @@ sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
 
 import lightgbm as lgb
 import numpy as np
+import scipy.sparse as sp
+from joblib import Parallel, delayed
 from rapidfuzz import distance, fuzz
 from sklearn.feature_extraction.text import TfidfVectorizer
 
@@ -402,6 +404,7 @@ class EntityResolutionClassifier:
         num_leaves: int = 31,
         split_source_models: bool = False,
         use_decision_layer: bool = True,
+        n_jobs: int = -1,
     ):
         self.threshold = threshold
         self.threshold_s2 = threshold
@@ -411,6 +414,7 @@ class EntityResolutionClassifier:
         self.num_leaves = num_leaves
         self.split_source_models = split_source_models
         self.use_decision_layer = use_decision_layer
+        self.n_jobs = n_jobs
         self.decision_layer = DecisionLayer()
 
         self.model: Optional[lgb.LGBMClassifier] = None
@@ -429,6 +433,15 @@ class EntityResolutionClassifier:
         self.is_vectorizer_fitted = False
 
         self.blocker = CandidateBlocker(k_neighbors=30, min_similarity=0.12)
+        
+        # High-throughput inference caches for target (S2/S3) records
+        self._target_prep_cache: Dict[str, Dict[str, any]] = {}
+        self._target_tfidf_cache: Dict[str, Tuple[any, any, any]] = {}
+
+    def clear_inference_cache(self):
+        """Clears cached preprocessed and vectorized target records to free memory."""
+        self._target_prep_cache.clear()
+        self._target_tfidf_cache.clear()
 
     def _fit_vectorizers(self, all_prep_records: List[Dict[str, any]]):
         """Fits TF-IDF character n-gram vectorizers on record corpora."""
@@ -633,6 +646,7 @@ class EntityResolutionClassifier:
         """
         Runs candidate generation (if not provided), scores pairs using 35 features,
         and returns {s1_id: set(matched_s2_s3_ids)}.
+        Optimized with target caching and multi-threaded parallel feature extraction.
         """
         if self.model is None and self.model_s2 is None:
             raise ValueError("Model must be trained before predicting.")
@@ -642,54 +656,101 @@ class EntityResolutionClassifier:
                 s1_records, s2_records, s3_records, verbose=verbose
             )
 
+        # 1. Preprocess S1 records for this chunk
         s1_prep = {eid: self.blocker.preprocess_record(r) for eid, r in s1_records.items()}
-        
-        # Only preprocess target records that actually appear in candidates
+
+        # 2. Preprocess target records with cross-chunk cache
         needed_cids = set()
         for cset in candidates.values():
             needed_cids.update(cset)
-        target_recs = {}
-        for eid in needed_cids:
-            if eid in s2_records:
-                target_recs[eid] = s2_records[eid]
-            elif eid in s3_records:
-                target_recs[eid] = s3_records[eid]
-        target_prep = {eid: self.blocker.preprocess_record(r) for eid, r in target_recs.items()}
 
-        all_records = list(s1_prep.values()) + list(target_prep.values())
-        id_to_idx = {r["entity_id"]: i for i, r in enumerate(all_records)}
+        # Prune cache if it grows excessively large to prevent memory pressure
+        if len(self._target_prep_cache) > 500000:
+            self._target_prep_cache.clear()
+            self._target_tfidf_cache.clear()
 
-        # Transform with fitted vectorizers
-        X_name, X_addr, X_full = self._compute_vectorized_matrices(all_records)
+        missing_cids = [cid for cid in needed_cids if cid not in self._target_prep_cache]
+        for cid in missing_cids:
+            if cid in s2_records:
+                self._target_prep_cache[cid] = self.blocker.preprocess_record(s2_records[cid])
+            elif cid in s3_records:
+                self._target_prep_cache[cid] = self.blocker.preprocess_record(s3_records[cid])
 
+        target_prep = {cid: self._target_prep_cache[cid] for cid in needed_cids if cid in self._target_prep_cache}
+
+        # 3. Assemble candidate pair list
         pair_list = []
         for s1_id, cand_set in candidates.items():
             for cid in sorted(cand_set):
-                pair_list.append((s1_id, cid))
+                if cid in target_prep:
+                    pair_list.append((s1_id, cid))
 
         predictions: Dict[str, Set[str]] = {eid: set() for eid in s1_records}
         if not pair_list:
             return predictions
 
-        idx1_list = [id_to_idx[p[0]] for p in pair_list]
-        idx2_list = [id_to_idx[p[1]] for p in pair_list]
+        # 4. Vectorized TF-IDF matrices with target vector cache
+        missing_tfidf_cids = [cid for cid in needed_cids if cid in target_prep and cid not in self._target_tfidf_cache]
+        if missing_tfidf_cids:
+            missing_target_prep = [target_prep[cid] for cid in missing_tfidf_cids]
+            t_nm, t_ad, t_fl = self._compute_vectorized_matrices(missing_target_prep)
+            for idx, cid in enumerate(missing_tfidf_cids):
+                self._target_tfidf_cache[cid] = (t_nm[idx], t_ad[idx], t_fl[idx])
 
-        # Vectorized dot products
-        nm_sims = np.asarray(X_name[idx1_list].multiply(X_name[idx2_list]).sum(axis=1)).ravel()
-        ad_sims = np.asarray(X_addr[idx1_list].multiply(X_addr[idx2_list]).sum(axis=1)).ravel()
-        full_sims = np.asarray(X_full[idx1_list].multiply(X_full[idx2_list]).sum(axis=1)).ravel()
+        # Vectorize S1 chunk records
+        s1_prep_list = list(s1_prep.values())
+        X_name_s1, X_addr_s1, X_full_s1 = self._compute_vectorized_matrices(s1_prep_list)
+        s1_id_to_idx = {r["entity_id"]: i for i, r in enumerate(s1_prep_list)}
 
-        X: List[List[float]] = []
-        for (s1_id, cid), nm_s, ad_s, full_s in zip(pair_list, nm_sims, ad_sims, full_sims):
-            r1 = s1_prep[s1_id]
-            r2 = target_prep[cid]
-            feat = extract_pair_features(
-                r1, r2,
-                nm_tfidf_cos=nm_s,
-                ad_tfidf_cos=ad_s if r1["addr_clean"] and r2["addr_clean"] else 0.0,
-                full_tfidf_cos=full_s
+        idx1_list = [s1_id_to_idx[p[0]] for p in pair_list]
+        target_nm_mat = sp.vstack([self._target_tfidf_cache[p[1]][0] for p in pair_list])
+        nm_sims = np.asarray(X_name_s1[idx1_list].multiply(target_nm_mat).sum(axis=1)).ravel()
+
+        target_ad_mat = sp.vstack([self._target_tfidf_cache[p[1]][1] for p in pair_list])
+        ad_sims = np.asarray(X_addr_s1[idx1_list].multiply(target_ad_mat).sum(axis=1)).ravel()
+
+        target_fl_mat = sp.vstack([self._target_tfidf_cache[p[1]][2] for p in pair_list])
+        full_sims = np.asarray(X_full_s1[idx1_list].multiply(target_fl_mat).sum(axis=1)).ravel()
+
+        # 5. Multi-threaded feature extraction
+        effective_n_jobs = self.n_jobs
+        if effective_n_jobs == -1:
+            effective_n_jobs = min(os.cpu_count() or 1, 16)
+
+        n_pairs = len(pair_list)
+        if n_pairs > 500 and effective_n_jobs > 1:
+            batch_size = max(250, n_pairs // (effective_n_jobs * 4))
+            pair_data = list(zip(pair_list, nm_sims, ad_sims, full_sims))
+            sub_chunks = [pair_data[i:i + batch_size] for i in range(0, n_pairs, batch_size)]
+
+            def _extract_subchunk(sub_items):
+                out = []
+                for (s1_id, cid), nm_s, ad_s, full_s in sub_items:
+                    r1 = s1_prep[s1_id]
+                    r2 = target_prep[cid]
+                    out.append(extract_pair_features(
+                        r1, r2,
+                        nm_tfidf_cos=nm_s,
+                        ad_tfidf_cos=ad_s if r1["addr_clean"] and r2["addr_clean"] else 0.0,
+                        full_tfidf_cos=full_s
+                    ))
+                return out
+
+            chunk_features = Parallel(n_jobs=effective_n_jobs, prefer="threads")(
+                delayed(_extract_subchunk)(c) for c in sub_chunks
             )
-            X.append(feat)
+            X = [f for sub in chunk_features for f in sub]
+        else:
+            X = []
+            for (s1_id, cid), nm_s, ad_s, full_s in zip(pair_list, nm_sims, ad_sims, full_sims):
+                r1 = s1_prep[s1_id]
+                r2 = target_prep[cid]
+                X.append(extract_pair_features(
+                    r1, r2,
+                    nm_tfidf_cos=nm_s,
+                    ad_tfidf_cos=ad_s if r1["addr_clean"] and r2["addr_clean"] else 0.0,
+                    full_tfidf_cos=full_s
+                ))
 
         X_arr = np.array(X, dtype=np.float32)
 
@@ -746,7 +807,7 @@ class EntityResolutionClassifier:
             pickle.dump(payload, f)
 
     @classmethod
-    def load(cls, model_path: str) -> "EntityResolutionClassifier":
+    def load(cls, model_path: str, n_jobs: int = -1) -> "EntityResolutionClassifier":
         """Loads trained model, vectorizers, and configuration from disk."""
         with open(model_path, "rb") as f:
             payload = pickle.load(f)
@@ -754,6 +815,7 @@ class EntityResolutionClassifier:
             threshold=payload["threshold"],
             split_source_models=payload.get("split_source_models", False),
             use_decision_layer=payload.get("use_decision_layer", True),
+            n_jobs=n_jobs,
         )
         clf.model = payload.get("model")
         clf.model_s2 = payload.get("model_s2")

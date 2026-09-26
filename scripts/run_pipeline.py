@@ -177,6 +177,7 @@ class PipelineOrchestrator:
         max_train_records: int = 50000,
         resume: bool = True,
         smoke_test: bool = False,
+        n_jobs: int = -1,
     ):
         self.train_dir = Path(train_dir).resolve()
         self.test_dir = Path(test_dir).resolve()
@@ -190,6 +191,7 @@ class PipelineOrchestrator:
         self.smoke_test = smoke_test
         self.batch_size = max(100, batch_size)
         self.max_train_records = max_train_records
+        self.n_jobs = n_jobs
 
         # Output paths
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -209,7 +211,7 @@ class PipelineOrchestrator:
         print("=" * 76)
         print(f"Device Mode:       {self.hw['device'].upper()} "
               f"({self.hw['gpu_info']['device_name'] if self.hw['gpu_info']['cuda_available'] else 'CPU Multi-Core'})")
-        print(f"CPU Workers:       {self.hw['cpu_cores']} threads")
+        print(f"CPU Workers:       {self.hw['cpu_cores']} threads (Configured n_jobs: {self.n_jobs})")
         print(f"System RAM:        {self.hw['avail_ram_gb']:.2f} GB free / {self.hw['total_ram_gb']:.2f} GB total")
         print(f"Train Dataset:     {self.train_dir}")
         print(f"Test Dataset:      {self.test_dir}")
@@ -249,7 +251,7 @@ class PipelineOrchestrator:
         stage_name = "stage1_train"
         if self.resume and is_stage_completed(self.checkpoint_dir, stage_name) and self.model_path.is_file():
             print(f"\n[Stage 1/3] Checkpoint found: Restoring trained model from {self.model_path}...")
-            return EntityResolutionClassifier.load(str(self.model_path))
+            return EntityResolutionClassifier.load(str(self.model_path), n_jobs=self.n_jobs)
 
         print("\n[Stage 1/3] Training Entity Resolution Pipeline...")
         t0 = time.time()
@@ -317,7 +319,7 @@ class PipelineOrchestrator:
             print(f"  [Large-Scale Guard] Sampled {len(s1_tr)} S1 entities ({len(s2_tr)} S2, {len(s3_tr)} S3) for GBDT training.")
 
         # Train classifier with auto hardware tuning
-        clf = EntityResolutionClassifier(use_decision_layer=True)
+        clf = EntityResolutionClassifier(use_decision_layer=True, n_jobs=self.n_jobs)
         clf.fit(s1_tr, s2_tr, s3_tr, gt_tr, tune_threshold=True, verbose=True)
 
         # Atomic checkpoint save
@@ -396,15 +398,30 @@ class PipelineOrchestrator:
         # Chunked inference to guarantee zero OOM
         chunk_size = self.batch_size
         num_chunks = (total_s1 + chunk_size - 1) // chunk_size
+        chunk_ckpts_dir = self.checkpoint_dir / "inference_chunks"
+        chunk_ckpts_dir.mkdir(parents=True, exist_ok=True)
 
         prog = load_chunk_progress(self.checkpoint_dir) if self.resume else None
         start_chunk = (prog["last_completed_chunk"] + 1) if (prog and "last_completed_chunk" in prog) else 0
 
         if start_chunk > 0:
             print(f"  * Resuming from chunk {start_chunk + 1}/{num_chunks}...")
-            cached_partial = load_json(self.checkpoint_dir / "partial_predictions.json")
-            if cached_partial:
-                final_predictions = {k: set(v) for k, v in cached_partial.items()}
+            # 1. Restore from dedicated chunk checkpoint files
+            chunk_files = sorted(chunk_ckpts_dir.glob("chunk_*.json"))
+            if chunk_files:
+                for cf in chunk_files:
+                    try:
+                        with open(cf, "r", encoding="utf-8") as f:
+                            c_dict = json.load(f)
+                        for k, v in c_dict.items():
+                            final_predictions[k] = set(v)
+                    except Exception:
+                        pass
+            # 2. Backward compatibility fallback for monolithic partial_predictions.json
+            if len(final_predictions) == 0:
+                cached_partial = load_json(self.checkpoint_dir / "partial_predictions.json")
+                if cached_partial:
+                    final_predictions = {k: set(v) for k, v in cached_partial.items()}
 
         for c_idx in range(start_chunk, num_chunks):
             mem_stat = check_memory_pressure(critical_ram_gb=1.2, auto_clean=True)
@@ -427,9 +444,14 @@ class PipelineOrchestrator:
             )
             final_predictions.update(chunk_preds)
 
-            # Save mid-batch progress
-            atomic_save_json({k: list(v) for k, v in final_predictions.items()}, self.checkpoint_dir / "partial_predictions.json")
+            # High-speed per-chunk checkpoint (O(1) serialization without indent)
+            chunk_file = chunk_ckpts_dir / f"chunk_{c_idx}.json"
+            atomic_save_json({k: list(v) for k, v in chunk_preds.items()}, chunk_file, indent=None)
             save_chunk_progress(self.checkpoint_dir, c_idx, num_chunks)
+
+            # Periodic consolidated partial backup every 50 chunks (without indent)
+            if (c_idx + 1) % 50 == 0 or c_idx == num_chunks - 1:
+                atomic_save_json({k: list(v) for k, v in final_predictions.items()}, self.checkpoint_dir / "partial_predictions.json", indent=None)
 
             pct = (c_end / total_s1) * 100.0
             print(f"  -> Processed [{c_end}/{total_s1}] entities ({pct:.1f}%) | {format_memory_summary()}")
@@ -548,6 +570,7 @@ def parse_args():
     parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto", help="Execution device (default: auto).")
     parser.add_argument("--batch-size", type=int, default=2000, help="Inference batch chunk size (default: 2000).")
     parser.add_argument("--max-train-records", type=int, default=50000, help="Max training entities to load into memory (default: 50000; set 0 for all).")
+    parser.add_argument("--n-jobs", type=int, default=-1, help="Number of CPU worker threads for feature extraction (default: -1 for all cores).")
     parser.add_argument("--no-resume", action="store_true", help="Do not resume; restart all stages fresh.")
     parser.add_argument("--smoke-test", action="store_true", help="Quick sanity run on small subset in ~10 seconds.")
     return parser.parse_args()
@@ -566,6 +589,7 @@ def main():
         max_train_records=args.max_train_records,
         resume=not args.no_resume,
         smoke_test=args.smoke_test,
+        n_jobs=args.n_jobs,
     )
     orchestrator.run()
 

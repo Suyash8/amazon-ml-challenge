@@ -17,11 +17,12 @@ import datetime
 logger = logging.getLogger("checkpoint")
 
 
-def atomic_save_json(data: Any, filepath: Union[Path, str], indent: int = 2) -> None:
+def atomic_save_json(data: Any, filepath: Union[Path, str], indent: Optional[int] = None) -> None:
     """
     Atomically persist a JSON-serializable dictionary to disk.
     Writes first to a `.tmp` file and replaces the destination file atomically,
     ensuring no half-written or corrupted files occur during unexpected crashes.
+    Defaults to indent=None (compact format) for ultra-high throughput on large datasets.
     """
     target_path = Path(filepath).resolve()
     target_path.parent.mkdir(parents=True, exist_ok=True)
