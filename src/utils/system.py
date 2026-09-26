@@ -130,3 +130,15 @@ def format_memory_summary() -> str:
             f"({vram_used:.2f}/{gpu_info['total_vram_gb']:.2f} GB VRAM)"
         )
     return f"RAM: {ram_pct:.1f}% ({ram_avail:.2f}/{ram_tot:.2f} GB free) | GPU: None (CPU mode)"
+
+
+def format_duration(seconds: float) -> str:
+    """Formats seconds into human-readable H:MM:SS or M:SS string."""
+    seconds = int(max(0, seconds))
+    h = seconds // 3600
+    m = (seconds % 3600) // 60
+    s = seconds % 60
+    if h > 0:
+        return f"{h}h {m:02d}m {s:02d}s"
+    return f"{m:02d}m {s:02d}s"
+

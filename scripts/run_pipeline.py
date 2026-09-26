@@ -52,6 +52,7 @@ try:
         deep_cleanup_memory,
         check_memory_pressure,
         format_memory_summary,
+        format_duration,
     )
     from src.utils.checkpoint import (
         atomic_save_json,
@@ -535,7 +536,11 @@ class PipelineOrchestrator:
                 if cached_partial:
                     final_predictions = {k: set(v) for k, v in cached_partial.items()}
 
+        start_entity_count = start_chunk * chunk_size
+
         for c_idx in range(start_chunk, num_chunks):
+            chunk_t0 = time.time()
+
             mem_stat = check_memory_pressure(critical_ram_gb=1.2, auto_clean=True)
             if mem_stat["should_throttle"]:
                 print(f"  [RAM Guard] High memory pressure ({mem_stat['available_gb']:.2f} GB free). Cleaned GC.")
@@ -568,8 +573,26 @@ class PipelineOrchestrator:
             del chunk_s1, chunk_cands, chunk_preds
             gc.collect()
 
+            chunk_time = time.time() - chunk_t0
+            chunk_entities = c_end - c_start
+            chunk_rate = chunk_entities / max(0.001, chunk_time)
+
+            elapsed_total = time.time() - t0
+            entities_done_session = c_end - start_entity_count
+            avg_rate = entities_done_session / max(0.001, elapsed_total)
+            remaining_entities = total_s1 - c_end
+            eta_seconds = remaining_entities / max(0.1, avg_rate)
+
             pct = (c_end / total_s1) * 100.0
-            print(f"  -> Processed [{c_end}/{total_s1}] entities ({pct:.1f}%) | {format_memory_summary()}")
+            time_now = datetime.datetime.now().strftime("%H:%M:%S")
+
+            print(
+                f"  [{time_now}] -> Processed [{c_end:,}/{total_s1:,}] entities ({pct:.1f}%) | "
+                f"Batch: {chunk_time:.1f}s ({chunk_rate:,.0f} ent/s) | "
+                f"Elapsed: {format_duration(elapsed_total)} | "
+                f"ETA: {format_duration(eta_seconds)} | "
+                f"{format_memory_summary()}"
+            )
 
         # Export official submission TSV
         write_matching_results_tsv(final_predictions, str(self.matches_out))
