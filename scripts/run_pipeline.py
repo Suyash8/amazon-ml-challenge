@@ -178,6 +178,7 @@ class PipelineOrchestrator:
         resume: bool = True,
         smoke_test: bool = False,
         n_jobs: int = -1,
+        re_score: bool = False,
     ):
         self.train_dir = Path(train_dir).resolve()
         self.test_dir = Path(test_dir).resolve()
@@ -192,6 +193,7 @@ class PipelineOrchestrator:
         self.batch_size = max(100, batch_size)
         self.max_train_records = max_train_records
         self.n_jobs = n_jobs
+        self.re_score = re_score
 
         # Output paths
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -200,6 +202,16 @@ class PipelineOrchestrator:
         self.candidates_out = self.output_dir / "candidate_pairs.tsv"
         self.matches_out = self.output_dir / "matching_results.tsv"
         self.scorecard_out = self.output_dir / "scorecard.json"
+
+        if self.re_score:
+            print("[Re-Score Mode] Resetting model and inference checkpoints to re-score existing candidates...")
+            for f in ["stage1_train.done", "stage3_inference.done", "chunk_progress.json", "partial_predictions.json", "lgbm_entity_resolver.pkl"]:
+                p = self.checkpoint_dir / f
+                if p.is_file():
+                    p.unlink()
+            chunk_dir = self.checkpoint_dir / "inference_chunks"
+            if chunk_dir.is_dir():
+                shutil.rmtree(str(chunk_dir), ignore_errors=True)
 
         # Hardware setup
         self.hw = discover_hardware(device)
@@ -277,46 +289,78 @@ class PipelineOrchestrator:
                 return str(d_alt)
             raise FileNotFoundError(f"Missing source file or shard directory for {filename_base} in {data_dir}")
 
-        if self.smoke_test:
-            max_load = 500
-        elif self.max_train_records and self.max_train_records > 0:
-            max_load = self.max_train_records
-        else:
-            max_load = None
-        print(f"  * Loading training data from {self.train_dir}...")
-        s1_tr = load_source_tsv(_find_source_path(self.train_dir, "train_source1"), max_records=max_load)
-        s2_tr = load_source_tsv(_find_source_path(self.train_dir, "train_source2"), max_records=max_load)
-        s3_tr = load_source_tsv(_find_source_path(self.train_dir, "train_source3"), max_records=max_load)
-        gt_tr = load_ground_truth_tsv(_find_source_path(self.train_dir, "train_ground_truth"), max_records=max_load)
+        # Smart Ground-Truth Sampled Training with guaranteed positive match coverage
+        gt_path = _find_source_path(self.train_dir, "train_ground_truth")
+        s1_path = _find_source_path(self.train_dir, "train_source1")
+        s2_path = _find_source_path(self.train_dir, "train_source2")
+        s3_path = _find_source_path(self.train_dir, "train_source3")
+
+        print(f"  * Reading training ground truth from {gt_path}...")
+        gt_full = load_ground_truth_tsv(gt_path)
 
         if self.smoke_test:
-            smoke_s1 = list(s1_tr.keys())[:30]
-            s1_tr = {k: s1_tr[k] for k in smoke_s1}
-            gt_tr = {k: gt_tr.get(k, set()) for k in smoke_s1}
-            
-            # Filter S2 and S3 to only true matches + a small distractor sample (300 records each)
-            smoke_matches = set()
-            for s in smoke_s1:
-                smoke_matches.update(gt_tr.get(s, set()))
-            s2_keep = set(list(smoke_matches) + list(s2_tr.keys())[:300])
-            s3_keep = set(list(smoke_matches) + list(s3_tr.keys())[:300])
-            s2_tr = {k: s2_tr[k] for k in s2_keep if k in s2_tr}
-            s3_tr = {k: s3_tr[k] for k in s3_keep if k in s3_tr}
-            print(f"  [Smoke Test] Filtered to {len(s1_tr)} S1 entities, {len(s2_tr)} S2 records, {len(s3_tr)} S3 records.")
-        elif len(s1_tr) > 5000:
-            import random
-            rng = random.Random(42)
-            train_sample_keys = rng.sample(list(s1_tr.keys()), 5000)
-            s1_tr = {k: s1_tr[k] for k in train_sample_keys}
-            gt_tr = {k: gt_tr.get(k, set()) for k in train_sample_keys}
-            train_matches = set()
-            for s in train_sample_keys:
-                train_matches.update(gt_tr.get(s, set()))
-            s2_keep = set(list(train_matches) + list(s2_tr.keys())[:20000])
-            s3_keep = set(list(train_matches) + list(s3_tr.keys())[:20000])
-            s2_tr = {k: s2_tr[k] for k in s2_keep if k in s2_tr}
-            s3_tr = {k: s3_tr[k] for k in s3_keep if k in s3_tr}
-            print(f"  [Large-Scale Guard] Sampled {len(s1_tr)} S1 entities ({len(s2_tr)} S2, {len(s3_tr)} S3) for GBDT training.")
+            n_target_s1 = 30
+        else:
+            n_target_s1 = 5000 if not self.max_train_records else self.max_train_records
+
+        matched_s1 = [k for k, v in gt_full.items() if len(v) > 0]
+        singleton_s1 = [k for k, v in gt_full.items() if len(v) == 0]
+
+        import random
+        rng = random.Random(42)
+        n_match = min(int(n_target_s1 * 0.8), len(matched_s1))
+        n_single = min(n_target_s1 - n_match, len(singleton_s1))
+        sample_matched = rng.sample(matched_s1, n_match)
+        sample_singletons = rng.sample(singleton_s1, n_single)
+        selected_s1 = set(sample_matched + sample_singletons)
+
+        needed_s2 = set()
+        needed_s3 = set()
+        for s in sample_matched:
+            for m in gt_full[s]:
+                if m.startswith("S2-"):
+                    needed_s2.add(m)
+                elif m.startswith("S3-"):
+                    needed_s3.add(m)
+
+        print(f"  * Streaming training sources for {len(selected_s1)} S1 entities ({len(needed_s2)} S2, {len(needed_s3)} S3 true matches)...")
+
+        def _stream_source_subset(filepath, needed_ids, max_distractors=10000):
+            recs = {}
+            distractors = 0
+            with open(filepath, "r", encoding="utf-8") as f:
+                header = f.readline().strip().split("\t")
+                eid_idx = header.index("entity_id")
+                name_idx = header.index("business_name") if "business_name" in header else header.index("name")
+                addr_idx = header.index("business_address") if "business_address" in header else header.index("address")
+                cntry_idx = header.index("country")
+                for line in f:
+                    parts = line.strip().split("\t")
+                    eid = parts[eid_idx]
+                    if eid in needed_ids:
+                        recs[eid] = {
+                            "entity_id": eid,
+                            "business_name": parts[name_idx] if len(parts) > name_idx else "",
+                            "business_address": parts[addr_idx] if len(parts) > addr_idx else "",
+                            "country": parts[cntry_idx] if len(parts) > cntry_idx else "",
+                        }
+                    elif distractors < max_distractors and rng.random() < 0.05:
+                        recs[eid] = {
+                            "entity_id": eid,
+                            "business_name": parts[name_idx] if len(parts) > name_idx else "",
+                            "business_address": parts[addr_idx] if len(parts) > addr_idx else "",
+                            "country": parts[cntry_idx] if len(parts) > cntry_idx else "",
+                        }
+                        distractors += 1
+                    if len(recs) >= len(needed_ids) + max_distractors:
+                        break
+            return recs
+
+        s1_tr = _stream_source_subset(s1_path, selected_s1, max_distractors=0)
+        s2_tr = _stream_source_subset(s2_path, needed_s2, max_distractors=10000 if not self.smoke_test else 300)
+        s3_tr = _stream_source_subset(s3_path, needed_s3, max_distractors=10000 if not self.smoke_test else 300)
+        gt_tr = {k: gt_full[k] for k in s1_tr}
+        print(f"  * Training set assembled: {len(s1_tr)} S1, {len(s2_tr)} S2, {len(s3_tr)} S3 records.")
 
         # Train classifier with auto hardware tuning
         clf = EntityResolutionClassifier(use_decision_layer=True, n_jobs=self.n_jobs)
@@ -340,6 +384,27 @@ class PipelineOrchestrator:
         """Executes candidate blocking with memory monitoring."""
         stage_name = "stage2_blocking"
         cands_ckpt_file = self.checkpoint_dir / "candidates.json"
+
+        # Check if pre-computed candidate_pairs.tsv exists
+        if self.resume and self.candidates_out.is_file():
+            print(f"\n[Stage 2/3] Found existing candidate_pairs.tsv at {self.candidates_out}! Checking coverage...")
+            candidates = {}
+            target_s1_keys = set(s1_test.keys())
+            with open(self.candidates_out, "r", encoding="utf-8") as f:
+                f.readline()
+                for line in f:
+                    parts = line.strip().split("\t")
+                    s1 = parts[0]
+                    if s1 in target_s1_keys:
+                        cset = set(parts[1].split(",")) if len(parts) > 1 and parts[1] else set()
+                        candidates[s1] = cset
+                        if len(candidates) == len(target_s1_keys):
+                            break
+            if len(candidates) >= len(target_s1_keys):
+                print(f"  * Successfully loaded {len(candidates):,} candidate lists from {self.candidates_out.name}!")
+                return candidates
+            else:
+                print(f"  * candidate_pairs.tsv covered {len(candidates)}/{len(target_s1_keys)} test keys; generating fresh candidates...")
 
         if self.resume and is_stage_completed(self.checkpoint_dir, stage_name) and cands_ckpt_file.is_file():
             print(f"\n[Stage 2/3] Checkpoint found: Restoring candidate pairs from {cands_ckpt_file}...")
@@ -573,6 +638,7 @@ def parse_args():
     parser.add_argument("--n-jobs", type=int, default=-1, help="Number of CPU worker threads for feature extraction (default: -1 for all cores).")
     parser.add_argument("--no-resume", action="store_true", help="Do not resume; restart all stages fresh.")
     parser.add_argument("--smoke-test", action="store_true", help="Quick sanity run on small subset in ~10 seconds.")
+    parser.add_argument("--re-score", action="store_true", help="Re-train classifier with proper ground truth matches and re-run Stage 3 inference using existing candidate_pairs.tsv.")
     return parser.parse_args()
 
 
@@ -590,6 +656,7 @@ def main():
         resume=not args.no_resume,
         smoke_test=args.smoke_test,
         n_jobs=args.n_jobs,
+        re_score=args.re_score,
     )
     orchestrator.run()
 

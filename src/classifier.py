@@ -555,8 +555,11 @@ class EntityResolutionClassifier:
                 n_estimators=self.n_estimators,
                 learning_rate=self.learning_rate,
                 num_leaves=self.num_leaves,
+                reg_lambda=1.0,
+                min_child_samples=20,
                 random_state=42,
                 verbose=-1,
+                n_jobs=self.n_jobs,
             )
             self.model.fit(X_arr, y_arr)
             probs = self.model.predict_proba(X_arr)[:, 1]
@@ -572,8 +575,11 @@ class EntityResolutionClassifier:
                 n_estimators=self.n_estimators,
                 learning_rate=self.learning_rate,
                 num_leaves=self.num_leaves,
+                reg_lambda=1.0,
+                min_child_samples=20,
                 random_state=42,
                 verbose=-1,
+                n_jobs=self.n_jobs,
             )
             self.model_s2.fit(X_arr[is_s2_mask], y_arr[is_s2_mask])
 
@@ -581,8 +587,11 @@ class EntityResolutionClassifier:
                 n_estimators=self.n_estimators,
                 learning_rate=self.learning_rate,
                 num_leaves=self.num_leaves,
+                reg_lambda=1.0,
+                min_child_samples=20,
                 random_state=42,
                 verbose=-1,
+                n_jobs=self.n_jobs,
             )
             self.model_s3.fit(X_arr[is_s3_mask], y_arr[is_s3_mask])
 
