@@ -123,9 +123,10 @@ def format_memory_summary() -> str:
     gpu_info = get_gpu_memory_info()
 
     if gpu_info["cuda_available"]:
+        vram_used = max(gpu_info["allocated_gb"], gpu_info["reserved_gb"])
         return (
             f"RAM: {ram_pct:.1f}% ({ram_avail:.2f}/{ram_tot:.2f} GB free) | "
             f"GPU: {gpu_info['device_name']} "
-            f"({gpu_info['allocated_gb']:.2f}/{gpu_info['total_vram_gb']:.2f} GB VRAM)"
+            f"({vram_used:.2f}/{gpu_info['total_vram_gb']:.2f} GB VRAM)"
         )
     return f"RAM: {ram_pct:.1f}% ({ram_avail:.2f}/{ram_tot:.2f} GB free) | GPU: None (CPU mode)"

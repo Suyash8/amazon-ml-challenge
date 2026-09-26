@@ -565,6 +565,9 @@ class PipelineOrchestrator:
             if (c_idx + 1) % 50 == 0 or c_idx == num_chunks - 1:
                 atomic_save_json({k: list(v) for k, v in final_predictions.items()}, self.checkpoint_dir / "partial_predictions.json", indent=None)
 
+            del chunk_s1, chunk_cands, chunk_preds
+            gc.collect()
+
             pct = (c_end / total_s1) * 100.0
             print(f"  -> Processed [{c_end}/{total_s1}] entities ({pct:.1f}%) | {format_memory_summary()}")
 

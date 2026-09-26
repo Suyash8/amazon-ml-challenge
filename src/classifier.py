@@ -462,10 +462,14 @@ class EntityResolutionClassifier:
             try:
                 self._gpu_device = torch.device("cuda")
                 # Pre-allocate high-speed GPU tensor buffer in VRAM (for NVIDIA L4 / T4)
-                self._gpu_buffer = torch.zeros((100000, 35), dtype=torch.float32, device=self._gpu_device)
+                # 8,000,000 * 35 * 4 bytes = 1.12 GB VRAM
+                self._gpu_buffer = torch.zeros((8000000, 35), dtype=torch.float32, device=self._gpu_device)
             except Exception:
-                self._gpu_device = None
-                self._gpu_buffer = None
+                try:
+                    self._gpu_buffer = torch.zeros((1000000, 35), dtype=torch.float32, device=self._gpu_device)
+                except Exception:
+                    self._gpu_device = None
+                    self._gpu_buffer = None
 
         self.model: Optional[lgb.LGBMClassifier] = None
         self.model_s2: Optional[lgb.LGBMClassifier] = None
@@ -731,14 +735,20 @@ class EntityResolutionClassifier:
         for cset in candidates.values():
             needed_cids.update(cset)
 
-        # Only prune cache under severe memory pressure (< 2.5 GB free RAM)
+        # Rolling cache bound to prevent RAM explosion over 1.7M records (keeps RAM under 30%)
+        if len(self._target_prep_cache) > 150000:
+            self.clear_inference_cache()
+            import gc
+            gc.collect()
+
         try:
             from src.utils.system import get_available_ram_gb
-            if get_available_ram_gb() < 2.5:
+            if get_available_ram_gb() < 8.0:
                 self.clear_inference_cache()
+                import gc
+                gc.collect()
         except Exception:
-            if len(self._target_prep_cache) > 1500000:
-                self.clear_inference_cache()
+            pass
 
         missing_cids = [cid for cid in needed_cids if cid not in self._target_prep_cache]
         for cid in missing_cids:
