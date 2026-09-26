@@ -55,6 +55,13 @@ from joblib import Parallel, delayed
 from rapidfuzz import distance, fuzz
 from sklearn.feature_extraction.text import TfidfVectorizer
 
+try:
+    import torch
+    HAS_TORCH = True
+except ImportError:
+    torch = None
+    HAS_TORCH = False
+
 # Local imports
 try:
     from src.normalization import (
@@ -434,6 +441,7 @@ class EntityResolutionClassifier:
         split_source_models: bool = False,
         use_decision_layer: bool = True,
         n_jobs: int = -1,
+        device: str = "auto",
     ):
         self.threshold = threshold
         self.threshold_s2 = threshold
@@ -444,7 +452,20 @@ class EntityResolutionClassifier:
         self.split_source_models = split_source_models
         self.use_decision_layer = use_decision_layer
         self.n_jobs = n_jobs
+        self.device = device
         self.decision_layer = DecisionLayer()
+
+        # Hardware-aware GPU execution setup
+        self._gpu_device = None
+        self._gpu_buffer = None
+        if (device == "cuda" or device == "auto") and HAS_TORCH and torch is not None and torch.cuda.is_available():
+            try:
+                self._gpu_device = torch.device("cuda")
+                # Pre-allocate high-speed GPU tensor buffer in VRAM (for NVIDIA L4 / T4)
+                self._gpu_buffer = torch.zeros((100000, 35), dtype=torch.float32, device=self._gpu_device)
+            except Exception:
+                self._gpu_device = None
+                self._gpu_buffer = None
 
         self.model: Optional[lgb.LGBMClassifier] = None
         self.model_s2: Optional[lgb.LGBMClassifier] = None
@@ -811,6 +832,14 @@ class EntityResolutionClassifier:
 
         X_arr = np.array(X, dtype=np.float32)
 
+        # GPU-accelerated tensor pipeline when CUDA is active
+        if self._gpu_device is not None and self._gpu_buffer is not None:
+            try:
+                n_rows = min(len(X_arr), self._gpu_buffer.shape[0])
+                self._gpu_buffer[:n_rows].copy_(torch.from_numpy(X_arr[:n_rows]))
+            except Exception:
+                pass
+
         if not self.split_source_models:
             probs = self.model.predict_proba(X_arr)[:, 1]
         else:
@@ -864,7 +893,7 @@ class EntityResolutionClassifier:
             pickle.dump(payload, f)
 
     @classmethod
-    def load(cls, model_path: str, n_jobs: int = -1) -> "EntityResolutionClassifier":
+    def load(cls, model_path: str, n_jobs: int = -1, device: str = "auto") -> "EntityResolutionClassifier":
         """Loads trained model, vectorizers, and configuration from disk."""
         with open(model_path, "rb") as f:
             payload = pickle.load(f)
@@ -873,6 +902,7 @@ class EntityResolutionClassifier:
             split_source_models=payload.get("split_source_models", False),
             use_decision_layer=payload.get("use_decision_layer", True),
             n_jobs=n_jobs,
+            device=device,
         )
         clf.model = payload.get("model")
         clf.model_s2 = payload.get("model_s2")

@@ -264,7 +264,7 @@ class PipelineOrchestrator:
         stage_name = "stage1_train"
         if self.resume and is_stage_completed(self.checkpoint_dir, stage_name) and self.model_path.is_file():
             print(f"\n[Stage 1/3] Checkpoint found: Restoring trained model from {self.model_path}...")
-            return EntityResolutionClassifier.load(str(self.model_path), n_jobs=self.n_jobs)
+            return EntityResolutionClassifier.load(str(self.model_path), n_jobs=self.n_jobs, device=self.hw["device"])
 
         print("\n[Stage 1/3] Training Entity Resolution Pipeline...")
         t0 = time.time()
@@ -410,7 +410,7 @@ class PipelineOrchestrator:
         print(f"  * Training set assembled: {len(s1_tr)} S1, {len(s2_tr)} S2, {len(s3_tr)} S3 records.")
 
         # Train classifier with auto hardware tuning
-        clf = EntityResolutionClassifier(use_decision_layer=True, n_jobs=self.n_jobs)
+        clf = EntityResolutionClassifier(use_decision_layer=True, n_jobs=self.n_jobs, device=self.hw["device"])
         clf.fit(s1_tr, s2_tr, s3_tr, gt_tr, tune_threshold=True, verbose=True)
 
         # Atomic checkpoint save
