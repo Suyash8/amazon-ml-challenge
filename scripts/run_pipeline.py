@@ -174,7 +174,7 @@ class PipelineOrchestrator:
         checkpoint_dir: str,
         drive_sync_dir: Optional[str] = None,
         device: str = "auto",
-        batch_size: int = 2000,
+        batch_size: int = 10000,
         max_train_records: int = 50000,
         resume: bool = True,
         smoke_test: bool = False,
@@ -680,7 +680,7 @@ def parse_args():
     parser.add_argument("--checkpoint-dir", type=str, default="checkpoints", help="Directory for atomic stage checkpoints.")
     parser.add_argument("--drive-sync-dir", type=str, default=None, help="Google Drive path for persistent sync (e.g. /content/drive/MyDrive/amazon-ml-challenge).")
     parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto", help="Execution device (default: auto).")
-    parser.add_argument("--batch-size", type=int, default=2000, help="Inference batch chunk size (default: 2000).")
+    parser.add_argument("--batch-size", type=int, default=10000, help="Inference batch chunk size (default: 10000).")
     parser.add_argument("--max-train-records", type=int, default=50000, help="Max training entities to load into memory (default: 50000; set 0 for all).")
     parser.add_argument("--n-jobs", type=int, default=-1, help="Number of CPU worker threads for feature extraction (default: -1 for all cores).")
     parser.add_argument("--no-resume", action="store_true", help="Do not resume; restart all stages fresh.")

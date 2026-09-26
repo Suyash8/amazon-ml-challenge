@@ -217,6 +217,8 @@ class CandidateBlocker:
         first_st_word = st_name.split()[0] if st_name.split() else ""
 
         full_text = f"{nm_clean} {nm_sorted} {addr_clean}"
+        nm_len = len(nm_clean)
+        ad_len = len(addr_clean)
 
         return {
             "entity_id": eid,
@@ -227,6 +229,9 @@ class CandidateBlocker:
             "name_sorted": nm_sorted,
             "addr_clean": addr_clean,
             "addr_sorted": addr_sorted,
+            "name_ngrams": {nm_clean[i:i + 3] for i in range(nm_len - 2)} if nm_len >= 3 else ({nm_clean} if nm_clean else set()),
+            "addr_ngrams": {addr_clean[i:i + 3] for i in range(ad_len - 2)} if ad_len >= 3 else ({addr_clean} if addr_clean else set()),
+            "first_word": first_nm_word,
             "legal_suffix": extract_legal_suffix(nm),
             "unit": extract_unit_info(addr),
             "street_name": st_name,
