@@ -461,12 +461,11 @@ class EntityResolutionClassifier:
         if (device == "cuda" or device == "auto") and HAS_TORCH and torch is not None and torch.cuda.is_available():
             try:
                 self._gpu_device = torch.device("cuda")
-                # Pre-allocate high-speed GPU tensor buffer in VRAM (for NVIDIA L4 / T4)
-                # 8,000,000 * 35 * 4 bytes = 1.12 GB VRAM
-                self._gpu_buffer = torch.zeros((8000000, 35), dtype=torch.float32, device=self._gpu_device)
+                # Pre-allocate high-speed GPU tensor buffer in VRAM sized for batch (250,000 * 35 * 4 bytes = 35 MB VRAM)
+                self._gpu_buffer = torch.zeros((250000, 35), dtype=torch.float32, device=self._gpu_device)
             except Exception:
                 try:
-                    self._gpu_buffer = torch.zeros((1000000, 35), dtype=torch.float32, device=self._gpu_device)
+                    self._gpu_buffer = torch.zeros((50000, 35), dtype=torch.float32, device=self._gpu_device)
                 except Exception:
                     self._gpu_device = None
                     self._gpu_buffer = None
@@ -730,34 +729,17 @@ class EntityResolutionClassifier:
         # 1. Preprocess S1 records for this chunk
         s1_prep = {eid: self.blocker.preprocess_record(r) for eid, r in s1_records.items()}
 
-        # 2. Preprocess target records with cross-chunk cache
+        # 2. Preprocess target records needed for this chunk only
         needed_cids = set()
         for cset in candidates.values():
             needed_cids.update(cset)
 
-        # Rolling cache bound to prevent RAM explosion over 1.7M records (keeps RAM under 30%)
-        if len(self._target_prep_cache) > 150000:
-            self.clear_inference_cache()
-            import gc
-            gc.collect()
-
-        try:
-            from src.utils.system import get_available_ram_gb
-            if get_available_ram_gb() < 8.0:
-                self.clear_inference_cache()
-                import gc
-                gc.collect()
-        except Exception:
-            pass
-
-        missing_cids = [cid for cid in needed_cids if cid not in self._target_prep_cache]
-        for cid in missing_cids:
+        target_prep: Dict[str, Dict[str, any]] = {}
+        for cid in needed_cids:
             if cid in s2_records:
-                self._target_prep_cache[cid] = self.blocker.preprocess_record(s2_records[cid])
+                target_prep[cid] = self.blocker.preprocess_record(s2_records[cid])
             elif cid in s3_records:
-                self._target_prep_cache[cid] = self.blocker.preprocess_record(s3_records[cid])
-
-        target_prep = {cid: self._target_prep_cache[cid] for cid in needed_cids if cid in self._target_prep_cache}
+                target_prep[cid] = self.blocker.preprocess_record(s3_records[cid])
 
         # 3. Assemble candidate pair list
         pair_list = []
@@ -770,35 +752,22 @@ class EntityResolutionClassifier:
         if not pair_list:
             return predictions
 
-        # 4. High-performance pre-stacked target TF-IDF indexing (0.029s vs 1.15s)
-        missing_tfidf_cids = [cid for cid in needed_cids if cid in target_prep and cid not in self._target_cid_to_row]
-        if missing_tfidf_cids:
-            missing_target_prep = [target_prep[cid] for cid in missing_tfidf_cids]
-            t_nm, t_ad, t_fl = self._compute_vectorized_matrices(missing_target_prep)
-            start_row = len(self._target_cid_to_row)
-            for idx, cid in enumerate(missing_tfidf_cids):
-                self._target_cid_to_row[cid] = start_row + idx
-            if self._target_tfidf_nm is None:
-                self._target_tfidf_nm = t_nm
-                self._target_tfidf_ad = t_ad
-                self._target_tfidf_fl = t_fl
-            else:
-                self._target_tfidf_nm = sp.vstack([self._target_tfidf_nm, t_nm], format="csr")
-                self._target_tfidf_ad = sp.vstack([self._target_tfidf_ad, t_ad], format="csr")
-                self._target_tfidf_fl = sp.vstack([self._target_tfidf_fl, t_fl], format="csr")
+        # 4. Fast per-chunk vectorized indexing (zero cross-chunk accumulation, 0 MB memory leak)
+        target_prep_list = list(target_prep.values())
+        t_nm, t_ad, t_fl = self._compute_vectorized_matrices(target_prep_list)
+        target_cid_to_row = {r["entity_id"]: idx for idx, r in enumerate(target_prep_list)}
 
-        # Vectorize S1 chunk records
         s1_prep_list = list(s1_prep.values())
         X_name_s1, X_addr_s1, X_full_s1 = self._compute_vectorized_matrices(s1_prep_list)
         s1_id_to_idx = {r["entity_id"]: i for i, r in enumerate(s1_prep_list)}
 
         idx1_list = [s1_id_to_idx[p[0]] for p in pair_list]
-        idx2_list = [self._target_cid_to_row[p[1]] for p in pair_list]
+        idx2_list = [target_cid_to_row[p[1]] for p in pair_list]
 
         # Fast O(1) slice multiplication without Python sp.vstack row iteration
-        nm_sims = np.asarray(X_name_s1[idx1_list].multiply(self._target_tfidf_nm[idx2_list]).sum(axis=1)).ravel()
-        ad_sims = np.asarray(X_addr_s1[idx1_list].multiply(self._target_tfidf_ad[idx2_list]).sum(axis=1)).ravel()
-        full_sims = np.asarray(X_full_s1[idx1_list].multiply(self._target_tfidf_fl[idx2_list]).sum(axis=1)).ravel()
+        nm_sims = np.asarray(X_name_s1[idx1_list].multiply(t_nm[idx2_list]).sum(axis=1)).ravel()
+        ad_sims = np.asarray(X_addr_s1[idx1_list].multiply(t_ad[idx2_list]).sum(axis=1)).ravel()
+        full_sims = np.asarray(X_full_s1[idx1_list].multiply(t_fl[idx2_list]).sum(axis=1)).ravel()
 
         # 5. Multi-threaded feature extraction
         effective_n_jobs = self.n_jobs
@@ -871,15 +840,17 @@ class EntityResolutionClassifier:
 
         # Stage-2 Decision Layer prediction (handles singleton gating & asymmetric thresholding)
         if self.use_decision_layer and self.decision_layer is not None and self.decision_layer.is_optimized:
-            return self.decision_layer.predict(cand_probs_by_s1)
+            out_preds = self.decision_layer.predict(cand_probs_by_s1)
+        else:
+            # Fallback flat thresholding
+            for (s1_id, cid), p in zip(pair_list, probs):
+                th = self.threshold_s2 if cid.startswith("S2-") else self.threshold_s3
+                if p >= th:
+                    predictions[s1_id].add(cid)
+            out_preds = predictions
 
-        # Fallback flat thresholding
-        for (s1_id, cid), p in zip(pair_list, probs):
-            th = self.threshold_s2 if cid.startswith("S2-") else self.threshold_s3
-            if p >= th:
-                predictions[s1_id].add(cid)
-
-        return predictions
+        del pair_list, probs, X, X_arr, s1_prep, target_prep, target_prep_list, s1_prep_list, t_nm, t_ad, t_fl, target_cid_to_row, s1_id_to_idx, idx1_list, idx2_list, nm_sims, ad_sims, full_sims, cand_probs_by_s1
+        return out_preds
 
     def save(self, model_path: str):
         """Saves trained model, vectorizers, and configuration to disk."""

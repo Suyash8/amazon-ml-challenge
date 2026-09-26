@@ -518,23 +518,7 @@ class PipelineOrchestrator:
         start_chunk = (prog["last_completed_chunk"] + 1) if (prog and "last_completed_chunk" in prog) else 0
 
         if start_chunk > 0:
-            print(f"  * Resuming from chunk {start_chunk + 1}/{num_chunks}...")
-            # 1. Restore from dedicated chunk checkpoint files
-            chunk_files = sorted(chunk_ckpts_dir.glob("chunk_*.json"))
-            if chunk_files:
-                for cf in chunk_files:
-                    try:
-                        with open(cf, "r", encoding="utf-8") as f:
-                            c_dict = json.load(f)
-                        for k, v in c_dict.items():
-                            final_predictions[k] = set(v)
-                    except Exception:
-                        pass
-            # 2. Backward compatibility fallback for monolithic partial_predictions.json
-            if len(final_predictions) == 0:
-                cached_partial = load_json(self.checkpoint_dir / "partial_predictions.json")
-                if cached_partial:
-                    final_predictions = {k: set(v) for k, v in cached_partial.items()}
+            print(f"  * Resuming from chunk {start_chunk + 1}/{num_chunks} (chunks 1-{start_chunk} already persisted on disk)...")
 
         start_entity_count = start_chunk * chunk_size
 
@@ -559,18 +543,14 @@ class PipelineOrchestrator:
                 candidates=chunk_cands,
                 verbose=False,
             )
-            final_predictions.update(chunk_preds)
 
             # High-speed per-chunk checkpoint (O(1) serialization without indent)
             chunk_file = chunk_ckpts_dir / f"chunk_{c_idx}.json"
             atomic_save_json({k: list(v) for k, v in chunk_preds.items()}, chunk_file, indent=None)
             save_chunk_progress(self.checkpoint_dir, c_idx, num_chunks)
 
-            # Periodic consolidated partial backup every 50 chunks (without indent)
-            if (c_idx + 1) % 50 == 0 or c_idx == num_chunks - 1:
-                atomic_save_json({k: list(v) for k, v in final_predictions.items()}, self.checkpoint_dir / "partial_predictions.json", indent=None)
-
             del chunk_s1, chunk_cands, chunk_preds
+            clf.clear_inference_cache()
             gc.collect()
 
             chunk_time = time.time() - chunk_t0
@@ -594,14 +574,27 @@ class PipelineOrchestrator:
                 f"{format_memory_summary()}"
             )
 
-        # Export official submission TSV
-        write_matching_results_tsv(final_predictions, str(self.matches_out))
+        # Assemble official submission TSV by streaming chunk files (0 MB RAM overhead)
+        print(f"\n  * Assembling final {self.matches_out.name} from {num_chunks} chunk files...")
+        total_matched_entities = 0
+        with open(self.matches_out, "w", encoding="utf-8") as out_f:
+            out_f.write("source1_entity_id\tmatched_entity_ids\n")
+            for c_idx in range(num_chunks):
+                chunk_file = chunk_ckpts_dir / f"chunk_{c_idx}.json"
+                if chunk_file.is_file():
+                    with open(chunk_file, "r", encoding="utf-8") as f:
+                        c_dict = json.load(f)
+                    for k in sorted(c_dict.keys()):
+                        m_list = sorted(c_dict[k])
+                        if m_list:
+                            total_matched_entities += 1
+                        out_f.write(f"{k}\t{','.join(m_list)}\n")
+                    del c_dict
 
         # Checkpoint complete stage
-        atomic_save_json({k: list(v) for k, v in final_predictions.items()}, matches_ckpt_file)
         mark_stage_completed(self.checkpoint_dir, stage_name, {
             "total_entities": total_s1,
-            "total_matched_entities": sum(1 for v in final_predictions.values() if len(v) > 0),
+            "total_matched_entities": total_matched_entities,
             "duration_s": time.time() - t0,
         })
         self.sync_to_drive()
