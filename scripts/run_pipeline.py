@@ -433,7 +433,7 @@ class PipelineOrchestrator:
                                 "business_address": parts[addr_idx] if len(parts) > addr_idx else "",
                                 "country": parts[cntry_idx] if len(parts) > cntry_idx else "",
                             }
-                        elif distractors < max_distractors and rng.random() < 0.05:
+                        elif distractors < max_distractors and rng.random() < 0.25:
                             recs[eid] = {
                                 "entity_id": eid,
                                 "business_name": parts[name_idx] if len(parts) > name_idx else "",
@@ -447,11 +447,12 @@ class PipelineOrchestrator:
 
             return recs
 
+        n_distractors = 100000 if not self.smoke_test else 2000
         s1_tr = _stream_source_subset(s1_path, selected_s1, max_distractors=0)
-        s2_tr = _stream_source_subset(s2_path, needed_s2, max_distractors=10000 if not self.smoke_test else 300)
-        s3_tr = _stream_source_subset(s3_path, needed_s3, max_distractors=10000 if not self.smoke_test else 300)
+        s2_tr = _stream_source_subset(s2_path, needed_s2, max_distractors=n_distractors)
+        s3_tr = _stream_source_subset(s3_path, needed_s3, max_distractors=n_distractors)
         gt_tr = {k: gt_full[k] for k in s1_tr}
-        print(f"  * Training set assembled: {len(s1_tr)} S1, {len(s2_tr)} S2, {len(s3_tr)} S3 records.")
+        print(f"  * Training set assembled with realistic hard negatives: {len(s1_tr)} S1, {len(s2_tr)} S2, {len(s3_tr)} S3 records.")
 
         # Train classifier with auto hardware tuning
         clf = EntityResolutionClassifier(use_decision_layer=True, n_jobs=self.n_jobs, device=self.hw["device"])
