@@ -48,6 +48,7 @@ data/
 
 # Intermediate outputs and checkpoints (mirrored to Google Drive)
 checkpoints/
+output/
 *.tmp
 *.tmp.*
 *.log

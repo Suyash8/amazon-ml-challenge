@@ -769,16 +769,39 @@ class EntityResolutionClassifier:
         ad_sims = np.asarray(X_addr_s1[idx1_list].multiply(t_ad[idx2_list]).sum(axis=1)).ravel()
         full_sims = np.asarray(X_full_s1[idx1_list].multiply(t_fl[idx2_list]).sum(axis=1)).ravel()
 
-        # 5. Multi-threaded feature extraction
+        # High-Speed Candidate Pruning:
+        # Obvious negative candidates with near-zero TF-IDF (<0.08) and no exact token match
+        # have ~0% probability of matching and can skip expensive 35-feature string distances.
+        pass_mask = (nm_sims >= 0.08) | (full_sims >= 0.08)
+        if not np.all(pass_mask):
+            failed_indices = np.where(~pass_mask)[0]
+            for idx in failed_indices:
+                s1_id, cid = pair_list[idx]
+                r1 = s1_prep[s1_id]
+                r2 = target_prep[cid]
+                if (r1["first_word"] and r1["first_word"] == r2["first_word"]) or \
+                   (r1["numbers"] and r2["numbers"] and r1["numbers"][0] == r2["numbers"][0]):
+                    pass_mask[idx] = True
+
+        eval_indices = np.where(pass_mask)[0]
+        eval_pairs = [pair_list[i] for i in eval_indices]
+        eval_nm = nm_sims[eval_indices]
+        eval_ad = ad_sims[eval_indices]
+        eval_fl = full_sims[eval_indices]
+
+        # 5. Multi-threaded feature extraction on candidate pairs that passed pre-filter
         effective_n_jobs = self.n_jobs
         if effective_n_jobs == -1:
             effective_n_jobs = min(os.cpu_count() or 1, 16)
 
-        n_pairs = len(pair_list)
-        if n_pairs > 500 and effective_n_jobs > 1:
-            batch_size = max(500, n_pairs // (effective_n_jobs * 4))
-            pair_data = list(zip(pair_list, nm_sims, ad_sims, full_sims))
-            sub_chunks = [pair_data[i:i + batch_size] for i in range(0, n_pairs, batch_size)]
+        n_eval = len(eval_pairs)
+        if n_eval == 0:
+            return predictions
+
+        if n_eval > 500 and effective_n_jobs > 1:
+            batch_size = max(500, n_eval // (effective_n_jobs * 4))
+            pair_data = list(zip(eval_pairs, eval_nm, eval_ad, eval_fl))
+            sub_chunks = [pair_data[i:i + batch_size] for i in range(0, n_eval, batch_size)]
 
             def _extract_subchunk(sub_items):
                 out = []
@@ -799,7 +822,7 @@ class EntityResolutionClassifier:
             X = [f for sub in chunk_features for f in sub]
         else:
             X = []
-            for (s1_id, cid), nm_s, ad_s, full_s in zip(pair_list, nm_sims, ad_sims, full_sims):
+            for (s1_id, cid), nm_s, ad_s, full_s in zip(eval_pairs, eval_nm, eval_ad, eval_fl):
                 r1 = s1_prep[s1_id]
                 r2 = target_prep[cid]
                 X.append(extract_pair_features(
@@ -819,21 +842,21 @@ class EntityResolutionClassifier:
             except Exception:
                 pass
 
+        eval_probs = np.zeros(n_eval, dtype=np.float32)
         if not self.split_source_models:
-            probs = self.model.predict_proba(X_arr)[:, 1]
+            eval_probs = self.model.predict_proba(X_arr)[:, 1]
         else:
-            is_s2_mask = np.array([p[1].startswith("S2-") for p in pair_list])
+            is_s2_mask = np.array([p[1].startswith("S2-") for p in eval_pairs])
             is_s3_mask = ~is_s2_mask
 
-            probs = np.zeros(len(pair_list), dtype=np.float32)
             if np.sum(is_s2_mask) > 0 and self.model_s2 is not None:
-                probs[is_s2_mask] = self.model_s2.predict_proba(X_arr[is_s2_mask])[:, 1]
+                eval_probs[is_s2_mask] = self.model_s2.predict_proba(X_arr[is_s2_mask])[:, 1]
             if np.sum(is_s3_mask) > 0 and self.model_s3 is not None:
-                probs[is_s3_mask] = self.model_s3.predict_proba(X_arr[is_s3_mask])[:, 1]
+                eval_probs[is_s3_mask] = self.model_s3.predict_proba(X_arr[is_s3_mask])[:, 1]
 
         # Group candidate probabilities per S1 entity
         cand_probs_by_s1 = defaultdict(list)
-        for (s1_id, cid), p in zip(pair_list, probs):
+        for (s1_id, cid), p in zip(eval_pairs, eval_probs):
             cand_probs_by_s1[s1_id].append((cid, float(p)))
         for s1_id in list(s1_records.keys()):
             cand_probs_by_s1[s1_id].sort(key=lambda x: -x[1])
@@ -843,13 +866,13 @@ class EntityResolutionClassifier:
             out_preds = self.decision_layer.predict(cand_probs_by_s1)
         else:
             # Fallback flat thresholding
-            for (s1_id, cid), p in zip(pair_list, probs):
+            for (s1_id, cid), p in zip(eval_pairs, eval_probs):
                 th = self.threshold_s2 if cid.startswith("S2-") else self.threshold_s3
                 if p >= th:
                     predictions[s1_id].add(cid)
             out_preds = predictions
 
-        del pair_list, probs, X, X_arr, s1_prep, target_prep, target_prep_list, s1_prep_list, t_nm, t_ad, t_fl, target_cid_to_row, s1_id_to_idx, idx1_list, idx2_list, nm_sims, ad_sims, full_sims, cand_probs_by_s1
+        del eval_pairs, eval_probs, X, X_arr, s1_prep, target_prep, target_prep_list, s1_prep_list, t_nm, t_ad, t_fl, target_cid_to_row, s1_id_to_idx, idx1_list, idx2_list, nm_sims, ad_sims, full_sims, cand_probs_by_s1, pass_mask
         return out_preds
 
     def save(self, model_path: str):

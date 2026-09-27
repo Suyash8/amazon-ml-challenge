@@ -181,14 +181,23 @@ class PipelineOrchestrator:
         smoke_test: bool = False,
         n_jobs: int = -1,
         re_score: bool = False,
+        run_id: Optional[str] = None,
+        candidate_pairs_path: Optional[str] = None,
     ):
         self.train_dir = Path(train_dir).resolve()
         self.test_dir = Path(test_dir).resolve()
-        self.output_dir = Path(output_dir).resolve()
-        if smoke_test and Path(checkpoint_dir).name == "checkpoints":
-            self.checkpoint_dir = (Path(checkpoint_dir) / "smoke_test").resolve()
+        self.base_output_dir = Path(output_dir).resolve()
+        self.base_checkpoint_dir = Path(checkpoint_dir).resolve()
+
+        if run_id:
+            self.run_id = run_id
+        elif smoke_test:
+            self.run_id = f"smoke_test_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
         else:
-            self.checkpoint_dir = Path(checkpoint_dir).resolve()
+            self.run_id = f"run_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
+
+        self.output_dir = (self.base_output_dir / "runs" / self.run_id).resolve()
+        self.checkpoint_dir = (self.base_checkpoint_dir / "runs" / self.run_id).resolve()
         self.drive_sync_dir = Path(drive_sync_dir).resolve() if drive_sync_dir else None
         self.resume = resume
         self.smoke_test = smoke_test
@@ -196,6 +205,7 @@ class PipelineOrchestrator:
         self.max_train_records = max_train_records
         self.n_jobs = n_jobs
         self.re_score = re_score
+        self.candidate_pairs_path = Path(candidate_pairs_path).resolve() if candidate_pairs_path else None
 
         # Output paths
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -204,6 +214,14 @@ class PipelineOrchestrator:
         self.candidates_out = self.output_dir / "candidate_pairs.tsv"
         self.matches_out = self.output_dir / "matching_results.tsv"
         self.scorecard_out = self.output_dir / "scorecard.json"
+
+        # If external candidate pairs path provided and candidates_out doesn't exist, link/copy
+        if self.candidate_pairs_path and self.candidate_pairs_path.is_file() and not self.candidates_out.is_file():
+            print(f"[*] Linking pre-computed candidates from {self.candidate_pairs_path} to {self.candidates_out}...")
+            try:
+                os.link(str(self.candidate_pairs_path), str(self.candidates_out))
+            except (OSError, AttributeError):
+                shutil.copy2(str(self.candidate_pairs_path), str(self.candidates_out))
 
         if self.re_score:
             print("[Re-Score Mode] Resetting model and inference checkpoints to re-score existing candidates...")
@@ -223,37 +241,56 @@ class PipelineOrchestrator:
         print("=" * 76)
         print("   AMAZON ML CHALLENGE 2026 - COLAB & GPU HIGH-PERFORMANCE RUNNER")
         print("=" * 76)
+        print(f"Run ID:            {self.run_id}")
         print(f"Device Mode:       {self.hw['device'].upper()} "
               f"({self.hw['gpu_info']['device_name'] if self.hw['gpu_info']['cuda_available'] else 'CPU Multi-Core'})")
         print(f"CPU Workers:       {self.hw['cpu_cores']} threads (Configured n_jobs: {self.n_jobs})")
         print(f"System RAM:        {self.hw['avail_ram_gb']:.2f} GB free / {self.hw['total_ram_gb']:.2f} GB total")
         print(f"Train Dataset:     {self.train_dir}")
         print(f"Test Dataset:      {self.test_dir}")
-        print(f"Output Directory:  {self.output_dir}")
-        print(f"Checkpoints:       {self.checkpoint_dir} (Resume: {self.resume})")
+        print(f"Run Output Dir:    {self.output_dir}")
+        print(f"Run Checkpoints:   {self.checkpoint_dir} (Resume: {self.resume})")
         if self.drive_sync_dir:
-            print(f"Google Drive Sync: {self.drive_sync_dir}")
+            print(f"Google Drive Sync: {self.drive_sync_dir} (runs/{self.run_id})")
         print(f"Smoke Test:        {self.smoke_test}")
         print("-" * 76)
 
+    def _update_latest_pointer(self):
+        """Updates local latest directory and top-level files for easy access."""
+        try:
+            latest_dir = self.base_output_dir / "latest"
+            latest_dir.mkdir(parents=True, exist_ok=True)
+            for f in self.output_dir.glob("*"):
+                if f.is_file():
+                    shutil.copy2(f, latest_dir / f.name)
+                    # Also keep top-level copy in output/ for backward compatibility
+                    shutil.copy2(f, self.base_output_dir / f.name)
+        except Exception as e:
+            print(f"[Warning] Could not update local latest pointer: {e}")
+
     def sync_to_drive(self):
         """Mirror output artifacts and checkpoints to Google Drive for persistence."""
+        self._update_latest_pointer()
         if not self.drive_sync_dir:
             return
         try:
             self.drive_sync_dir.mkdir(parents=True, exist_ok=True)
-            drive_output = self.drive_sync_dir / "output"
-            drive_ckpts = self.drive_sync_dir / "checkpoints"
-            drive_output.mkdir(parents=True, exist_ok=True)
-            drive_ckpts.mkdir(parents=True, exist_ok=True)
+            drive_runs_output = self.drive_sync_dir / "runs" / self.run_id
+            drive_runs_ckpts = self.drive_sync_dir / "checkpoints" / self.run_id
+            drive_latest_output = self.drive_sync_dir / "latest"
+
+            drive_runs_output.mkdir(parents=True, exist_ok=True)
+            drive_runs_ckpts.mkdir(parents=True, exist_ok=True)
+            drive_latest_output.mkdir(parents=True, exist_ok=True)
 
             for f in self.output_dir.glob("*"):
                 if f.is_file():
-                    shutil.copy2(f, drive_output / f.name)
+                    shutil.copy2(f, drive_runs_output / f.name)
+                    shutil.copy2(f, drive_latest_output / f.name)
             for f in self.checkpoint_dir.glob("*"):
                 if f.is_file():
-                    shutil.copy2(f, drive_ckpts / f.name)
-            print(f"[Drive Sync] Mirrored checkpoints and outputs to {self.drive_sync_dir}")
+                    shutil.copy2(f, drive_runs_ckpts / f.name)
+            print(f"[Drive Sync] Mirrored checkpoints and outputs to Google Drive (runs/{self.run_id} & latest)")
         except Exception as e:
             print(f"[Drive Sync Warning] Could not sync to drive: {e}")
 
@@ -705,6 +742,8 @@ def parse_args():
     parser.add_argument("--no-resume", action="store_true", help="Do not resume; restart all stages fresh.")
     parser.add_argument("--smoke-test", action="store_true", help="Quick sanity run on small subset in ~10 seconds.")
     parser.add_argument("--re-score", action="store_true", help="Re-train classifier with proper ground truth matches and re-run Stage 3 inference using existing candidate_pairs.tsv.")
+    parser.add_argument("--run-id", type=str, default=None, help="Custom identifier for this run (e.g. prod_l4_fast_01). Outputs saved under output/runs/<run_id>/.")
+    parser.add_argument("--candidate-pairs-path", type=str, default=None, help="Path to precomputed candidate_pairs.tsv to reuse for Stage 3 without re-running blocking.")
     return parser.parse_args()
 
 
@@ -723,6 +762,8 @@ def main():
         smoke_test=args.smoke_test,
         n_jobs=args.n_jobs,
         re_score=args.re_score,
+        run_id=args.run_id,
+        candidate_pairs_path=args.candidate_pairs_path,
     )
     orchestrator.run()
 
