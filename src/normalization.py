@@ -321,8 +321,11 @@ def clean_base_text(text: Optional[str]) -> str:
     s = re.sub(r'\bindiyana\b', 'indian', s)
     s = re.sub(r'\binphraa?\b', 'infra', s)
 
-    # 5. Remove URLs, email addresses, web domains (.com, .org, .in, etc.)
-    s = re.sub(r'https?://\S+|www\.\S+|\b\w+\.(?:com|org|net|edu|in|co\.in|fr)\b', ' ', s)
+    # 5. Handle URLs, email addresses, and web domains (.com, .org, .in, etc.)
+    # Preserve domain root (e.g. 'barneskimble.com' -> 'barneskimble', 'supercareprivate.com' -> 'supercareprivate')
+    s = re.sub(r'https?://(?:www\.)?(\S+)', r' \1 ', s, flags=re.I)
+    s = re.sub(r'\b(?:www\.)?([a-zA-Z0-9_\-]+)\.(?:com|org|net|edu|co\.in|in|fr)\b', r' \1 ', s, flags=re.I)
+    s = re.sub(r'\b\w+@\w+\.\w+\b', ' ', s)
 
     # 6. Strip null placeholders
     s = re.sub(r'\b(?:null|<null>|none|nan)\b', ' ', s)

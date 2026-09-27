@@ -221,14 +221,16 @@ class AsymmetricDecisionPolicy:
     def __init__(
         self,
         tau_gate: float = 0.30,
-        t_first: float = 0.45,
-        t_second: float = 0.25,
-        delta_margin: float = 0.20,
+        t_first: float = 0.52,
+        t_second: float = 0.35,
+        delta_margin: float = 0.12,
+        max_matches: int = 5,
     ):
         self.tau_gate = tau_gate
         self.t_first = t_first
         self.t_second = t_second
         self.delta_margin = delta_margin
+        self.max_matches = max_matches
 
     def decide(
         self,
@@ -243,15 +245,17 @@ class AsymmetricDecisionPolicy:
         if p_has_match < self.tau_gate or not cand_probs:
             return set()
 
-        # 2. First Match Requirement (High Hurdle)
+        # 2. First Match Requirement (High Hurdle to protect precision)
         top_cid, top_p = cand_probs[0]
         if top_p < self.t_first:
             return set()
 
         matches = {top_cid}
 
-        # 3. Additional Matches (Asymmetric lower bar + relative margin)
+        # 3. Additional Matches (Asymmetric lower bar + relative margin + max matches cap)
         for cid, p in cand_probs[1:]:
+            if len(matches) >= self.max_matches:
+                break
             if p >= self.t_second and (top_p - p) <= self.delta_margin:
                 matches.add(cid)
 
@@ -273,15 +277,17 @@ class DecisionLayer:
     def __init__(
         self,
         tau_gate: float = 0.30,
-        t_first: float = 0.45,
-        t_second: float = 0.25,
-        delta_margin: float = 0.20,
+        t_first: float = 0.52,
+        t_second: float = 0.35,
+        delta_margin: float = 0.12,
+        max_matches: int = 5,
     ):
         self.policy = AsymmetricDecisionPolicy(
             tau_gate=tau_gate,
             t_first=t_first,
             t_second=t_second,
             delta_margin=delta_margin,
+            max_matches=max_matches,
         )
         self.gatekeeper = EntitySingletonGatekeeper()
         self.is_optimized = False
@@ -312,14 +318,21 @@ class DecisionLayer:
         if verbose:
             print("[DecisionLayer] 2/2 Direct Optimization for Macro F_0.5 Metric...")
 
-        # Parameter Search Grids
-        tau_gate_grid = [0.20, 0.30, 0.40, 0.50]
-        t_first_grid = [0.35, 0.45, 0.55, 0.65, 0.75]
-        t_second_grid = [0.15, 0.25, 0.35, 0.45]
-        delta_margin_grid = [0.10, 0.20, 0.30, 0.45]
+        # Parameter Search Grids with Precision Bias for F_0.5
+        tau_gate_grid = [0.25, 0.35, 0.45]
+        t_first_grid = [0.45, 0.52, 0.60, 0.68]
+        t_second_grid = [0.25, 0.35, 0.45]
+        delta_margin_grid = [0.08, 0.12, 0.18]
+        max_matches_grid = [4, 5, 6]
 
         best_f05 = -1.0
-        best_params = (self.policy.tau_gate, self.policy.t_first, self.policy.t_second, self.policy.delta_margin)
+        best_params = (
+            self.policy.tau_gate,
+            self.policy.t_first,
+            self.policy.t_second,
+            self.policy.delta_margin,
+            self.policy.max_matches,
+        )
 
         # Grid search over asymmetric policy space
         for tg in tau_gate_grid:
@@ -328,24 +341,26 @@ class DecisionLayer:
                     if ts > tf:
                         continue  # Secondary threshold must be <= primary
                     for dm in delta_margin_grid:
-                        test_policy = AsymmetricDecisionPolicy(
-                            tau_gate=tg, t_first=tf, t_second=ts, delta_margin=dm
-                        )
-                        preds = {
-                            s1_id: test_policy.decide(
-                                entity_cand_probs[s1_id], p_has_match_dict[s1_id]
+                        for mm in max_matches_grid:
+                            test_policy = AsymmetricDecisionPolicy(
+                                tau_gate=tg, t_first=tf, t_second=ts, delta_margin=dm, max_matches=mm
                             )
-                            for s1_id in all_s1_ids
-                        }
-                        score = compute_macro_f05(preds, ground_truth, all_s1_ids)
-                        if score > best_f05:
-                            best_f05 = score
-                            best_params = (tg, tf, ts, dm)
+                            preds = {
+                                s1_id: test_policy.decide(
+                                    entity_cand_probs[s1_id], p_has_match_dict[s1_id]
+                                )
+                                for s1_id in all_s1_ids
+                            }
+                            score = compute_macro_f05(preds, ground_truth, all_s1_ids)
+                            if score > best_f05:
+                                best_f05 = score
+                                best_params = (tg, tf, ts, dm, mm)
 
         self.policy.tau_gate = best_params[0]
         self.policy.t_first = best_params[1]
         self.policy.t_second = best_params[2]
         self.policy.delta_margin = best_params[3]
+        self.policy.max_matches = best_params[4]
         self.is_optimized = True
 
         dur = time.time() - t0
@@ -355,6 +370,7 @@ class DecisionLayer:
             print(f"  * Optimal t_first (primary match bar) : {self.policy.t_first:.3f}")
             print(f"  * Optimal t_second (multi-match bar)  : {self.policy.t_second:.3f}")
             print(f"  * Optimal delta_margin (drop limit)   : {self.policy.delta_margin:.3f}")
+            print(f"  * Optimal max_matches (cap per entity): {self.policy.max_matches}")
             print(f"  * Validation Macro F_0.5 Score        : {best_f05:.4f}")
 
     def predict(
