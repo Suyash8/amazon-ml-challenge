@@ -183,6 +183,7 @@ class PipelineOrchestrator:
         re_score: bool = False,
         run_id: Optional[str] = None,
         candidate_pairs_path: Optional[str] = None,
+        model_path: Optional[str] = None,
     ):
         self.train_dir = Path(train_dir).resolve()
         self.test_dir = Path(test_dir).resolve()
@@ -206,6 +207,7 @@ class PipelineOrchestrator:
         self.n_jobs = n_jobs
         self.re_score = re_score
         self.candidate_pairs_path = Path(candidate_pairs_path).resolve() if candidate_pairs_path else None
+        self.custom_model_path = Path(model_path).resolve() if model_path else None
 
         # Output paths
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -300,6 +302,10 @@ class PipelineOrchestrator:
     def train_or_load_model(self) -> EntityResolutionClassifier:
         """Trains LightGBM classifier or restores from atomic checkpoint."""
         stage_name = "stage1_train"
+        if self.custom_model_path and self.custom_model_path.is_file():
+            print(f"\n[Stage 1/3] Loading pre-trained model from {self.custom_model_path}...")
+            return EntityResolutionClassifier.load(str(self.custom_model_path), n_jobs=self.n_jobs, device=self.hw["device"])
+
         if self.resume and is_stage_completed(self.checkpoint_dir, stage_name) and self.model_path.is_file():
             print(f"\n[Stage 1/3] Checkpoint found: Restoring trained model from {self.model_path}...")
             return EntityResolutionClassifier.load(str(self.model_path), n_jobs=self.n_jobs, device=self.hw["device"])
@@ -745,6 +751,7 @@ def parse_args():
     parser.add_argument("--re-score", action="store_true", help="Re-train classifier with proper ground truth matches and re-run Stage 3 inference using existing candidate_pairs.tsv.")
     parser.add_argument("--run-id", type=str, default=None, help="Custom identifier for this run (e.g. prod_l4_fast_01). Outputs saved under output/runs/<run_id>/.")
     parser.add_argument("--candidate-pairs-path", type=str, default=None, help="Path to precomputed candidate_pairs.tsv to reuse for Stage 3 without re-running blocking.")
+    parser.add_argument("--model-path", type=str, default=None, help="Path to pre-trained lgbm_entity_resolver.pkl to bypass Stage 1 training.")
     return parser.parse_args()
 
 
@@ -765,6 +772,7 @@ def main():
         re_score=args.re_score,
         run_id=args.run_id,
         candidate_pairs_path=args.candidate_pairs_path,
+        model_path=args.model_path,
     )
     orchestrator.run()
 
