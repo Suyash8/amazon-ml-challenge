@@ -587,8 +587,9 @@ class PipelineOrchestrator:
             save_chunk_progress(self.checkpoint_dir, c_idx, num_chunks)
 
             del chunk_s1, chunk_cands, chunk_preds
-            clf.clear_inference_cache()
-            gc.collect()
+            if mem_stat["should_throttle"]:
+                clf.clear_inference_cache(force=True)
+                gc.collect()
 
             chunk_time = time.time() - chunk_t0
             chunk_entities = c_end - c_start
